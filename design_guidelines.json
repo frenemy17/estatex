@@ -1,0 +1,155 @@
+{
+  "theme": "Dark Mode (Tactical Luxury)",
+  "typography": {
+    "fonts": {
+      "heading": "Cormorant Garamond",
+      "body": "Manrope",
+      "mono": "IBM Plex Mono"
+    },
+    "hierarchy": {
+      "h1": "font-serif text-4xl sm:text-5xl tracking-tight leading-none text-slate-50",
+      "h2": "font-serif text-2xl sm:text-3xl tracking-tight text-slate-100",
+      "h3": "font-sans text-xl font-semibold tracking-tight text-slate-100",
+      "h4": "font-sans text-lg font-medium text-slate-200",
+      "body": "font-sans text-sm text-slate-400 leading-relaxed",
+      "data": "font-mono text-sm tracking-tight text-slate-300",
+      "label": "font-sans text-xs font-bold uppercase tracking-[0.2em] text-slate-500"
+    },
+    "rules": [
+      "Use Cormorant Garamond for major dashboard titles and large metric numbers to evoke premium real-estate luxury.",
+      "Use IBM Plex Mono for all AI reasoning logs, JSON outputs, qualification scores, and timestamps.",
+      "Use Manrope for dense UI components (tables, kanban cards, forms) to ensure readability."
+    ]
+  },
+  "colors": {
+    "background": {
+      "base": "#020617",
+      "surface": "#0f172a",
+      "surface_hover": "#1e293b"
+    },
+    "border": {
+      "default": "#1e293b",
+      "focus": "#38bdf8"
+    },
+    "text": {
+      "primary": "#f8fafc",
+      "secondary": "#94a3b8",
+      "muted": "#64748b"
+    },
+    "accents": {
+      "primary": "#fbbf24",
+      "primary_hover": "#f59e0b",
+      "ai_indicator": "#22d3ee",
+      "ai_glow": "rgba(34, 211, 238, 0.15)"
+    },
+    "status": {
+      "new": "#60a5fa",
+      "calling": "#22d3ee",
+      "in_conversation": "#818cf8",
+      "qualified": "#34d399",
+      "nurture": "#fbbf24",
+      "hot": "#ef4444",
+      "booked": "#d946ef"
+    },
+    "rules": [
+      "No generic full-screen gradients. Use deep slate backgrounds.",
+      "Primary CTA uses the Gold/Amber accent to signify value/conversion.",
+      "AI operations (Agent Calling, Reasoning) use the Electric Cyan accent.",
+      "Never use pure black or pure white. Always tint with the slate base."
+    ]
+  },
+  "visual_enhancers": {
+    "surfaces": [
+      "Dashboard Cards: Flat solid surface (bg-slate-900), 1px subtle border (border-slate-800), NO shadow by default.",
+      "AI Trace Panels: Retro-Futurism/Terminal look. Dark indigo base, monospace text, subtle cyan glowing border on active step.",
+      "Modals/Drawers: Crystal Glassmorphism. bg-slate-950/80, backdrop-blur-xl, 1px border-slate-800/50."
+    ],
+    "textures": [
+      "Use subtle noise overlay on the main dashboard background to kill digital flatness.",
+      "Use the 'Grid Borders' pattern for analytics sections: border-collapse style with borders on right and bottom of grid items."
+    ]
+  },
+  "grids": {
+    "dashboard_mode": "High Density Grid (Mode B)",
+    "rules": [
+      "Base Grid: grid-cols-1 md:grid-cols-3 lg:grid-cols-4 or 12-col bento.",
+      "Gap Strategy: Tight (gap-4 or gap-6).",
+      "Summary Widgets: col-span-1.",
+      "Main Charts/Pipeline: col-span-3 or col-span-full.",
+      "Every pixel must be utilized. Use h-full on children to stretch."
+    ]
+  },
+  "layouts": {
+    "navigation": "Left sidebar (w-64) for desktop, fixed. Contains Logo, Links, User Profile. Deep slate bg with subtle right border.",
+    "topbar": "Sticky top bar with breadcrumbs, Global Search, and 'New Lead' Gold button. Backdrop blur enabled.",
+    "kanban_pipeline": "Horizontal flex container with overflow-x-auto. Fixed width columns (w-80) for each lead state. Hide scrollbars.",
+    "lead_drawer": "Right-side slide-out panel (w-[800px] max-w-[90vw]). Dual-pane internal layout: Left 40% (Lead info & Score), Right 60% (AI Transcript & Reasoning Trace)."
+  },
+  "motion": {
+    "rules": [
+      "Hover States: Subtle lift (-translate-y-[1px]) and border color change.",
+      "Kanban Drag: Use framer-motion layout animations for reordering.",
+      "AI Trace Panel: Progressive disclosure. When a reasoning step expands, animate height using framer-motion AnimatePresence.",
+      "AI Calling State: Add a subtle pulsing cyan dot next to leads currently in 'CALLING' or 'IN_CONVERSATION' state."
+    ]
+  },
+  "accessibility": {
+    "rules": [
+      "Text Contrast: Ensure all secondary text (slate-400) passes APCA against slate-900 background.",
+      "Focus States: Use focus:ring-2 focus:ring-cyan-400 focus:outline-none.",
+      "Test IDs: All interactive elements MUST include a data-testid attribute (e.g., data-testid=\"lead-card-123\", data-testid=\"kanban-column-hot\")."
+    ]
+  },
+  "media": {
+    "icons": "Use @phosphor-icons/react for a high-end, duotone/technical look perfect for ops dashboards.",
+    "charts": "Use Shadcn charts (Recharts under the hood). Apply custom colors from the status palette."
+  },
+  "image_urls": {
+    "login_background": {
+      "url": "https://images.pexels.com/photos/30211366/pexels-photo-30211366.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+      "description": "Stylish modern white house exterior with palm trees. Use as a blurred or dark-overlay background for the public Lead Capture / Login page."
+    },
+    "agent_avatar_1": {
+      "url": "https://images.pexels.com/photos/29852852/pexels-photo-29852852.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+      "description": "Elegant studio portrait. Use as placeholder for Real-Estate Broker user profile."
+    },
+    "lead_avatar_1": {
+      "url": "https://images.pexels.com/photos/37148308/pexels-photo-37148308.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+      "description": "Confident business professional. Use as placeholder for Lead avatars in Kanban cards."
+    }
+  },
+  "component_name": {
+    "LeadKanbanBoard": "Renders the grouped pipeline columns.",
+    "LeadCard": "Dense tactical card showing score, name, budget.",
+    "AITracePanel": "Timeline UI for V2 LangGraph supervisor reasoning.",
+    "QualificationGauge": "0-100 visual score indicator.",
+    "DashboardMetrics": "Top row KPI bento grid."
+  },
+  "3d_libraries": {
+    "decision": "Not required for core dashboard functionality. Use Framer Motion for 2D micro-interactions. Consider Visx or D3 for the Funnel Chart if complex, otherwise stick to Recharts/Shadcn."
+  },
+  "instructions_to_main_agent": [
+    "Install necessary font dependencies via Google Fonts (Cormorant Garamond, Manrope, IBM Plex Mono) in index.css.",
+    "Install @phosphor-icons/react, framer-motion, recharts, clsx, tailwind-merge.",
+    "Use standard HTML 5 semantics and avoid deep div soup.",
+    "Implement the Kanban board using flex/grid; drag-and-drop can be mocked with simple state updates or use a lightweight dnd library if requested.",
+    "The V2 LangGraph supervisor trace MUST look like a technical timeline: monospace fonts, distinct tool-call vs thought visual states, collapsible JSON bodies.",
+    "Use data-testid on every clickable element."
+  ],
+  "UNIVERSAL GUIDELINES FOR MAIN AGENT": [
+    "Do not use universal transitions (transition: all). Target specific properties.",
+    "Do not text-align: center the main App container. Keep text left-aligned for readability.",
+    "Use 2-3x more padding than usual (e.g., p-6 or p-8 inside panels).",
+    "Never use pure #000 or #FFF; tint with slate.",
+    "Use Sonner for toast notifications.",
+    "Avoid AI slop: no generic centered layouts, no standard blue gradients, no robot emojis. Use professional Phosphor icons.",
+    "Prioritize Shadcn components but customize their tailwind classes heavily to match the Tactical Luxury theme."
+  ],
+  "GENERAL UI UX DESIGN GUIDELINES": [
+    "Progressive Disclosure: In the AI Trace panel, show the high-level steps (e.g., 'Analyzing Budget', 'Booking Calendar') and hide the raw JSON/tool-calls behind an expand toggle.",
+    "North Star Metric: Place the most critical KPI (e.g., 'Total Hot Leads' or 'Pipeline Value') in the top-left of the analytics view.",
+    "Optical Alignment: Ensure icons inside Kanban cards perfectly align with the text baselines.",
+    "Visual Hierarchy: Use font weights and mono-spacing to separate data (numbers/scores) from labels.",
+    "Empty States: If a Kanban column is empty, show a dashed-border drop zone with a subtle mono label, not just blank space."
+  ]
+}
