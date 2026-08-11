@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal, Optional
 
+import certifi
 from dotenv import load_dotenv
 import google.generativeai as genai
 import requests
@@ -36,7 +37,10 @@ log = logging.getLogger("lead-qualifier")
 
 # ---------- DB ----------
 mongo_url = os.environ["MONGO_URL"]
-client = AsyncIOMotorClient(mongo_url)
+client_kwargs = {}
+if "mongodb+srv" in mongo_url:
+    client_kwargs["tlsCAFile"] = certifi.where()
+client = AsyncIOMotorClient(mongo_url, **client_kwargs)
 db = client[os.environ["DB_NAME"]]
 
 EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY")
