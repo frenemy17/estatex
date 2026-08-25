@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import { api, STATUS_META, scoreBand } from "../lib/api";
+import { api, STATUS_META, isErrorEvent, scoreBand } from "../lib/api";
+import { usePoll } from "../lib/usePoll";
 import { Button } from "../components/ui/button";
 import { toast } from "sonner";
-import { ArrowLeft, Robot, Brain, CalendarCheck, Phone, Sparkle, Check } from "@phosphor-icons/react";
+import { ArrowLeft, Robot, Brain, CalendarCheck, Phone, Sparkle, Check, Warning } from "@phosphor-icons/react";
 
 export default function LeadDetail() {
     const { id } = useParams();
@@ -30,15 +31,20 @@ export default function LeadDetail() {
     }
 
     async function loadSlots() {
-        const { data } = await api.get(`/leads/${id}/slots`);
-        setSlots(data.slots);
+        try {
+            const { data } = await api.get(`/leads/${id}/slots`);
+            setSlots(data.slots);
+        } catch {
+            setSlots([]);
+        }
     }
 
-    useEffect(() => {
+    usePoll(() => {
         load();
+    }, 8000, [id]);
+
+    useEffect(() => {
         loadSlots();
-        const t = setInterval(load, 3000);
-        return () => clearInterval(t);
     }, [id]);
 
     async function bookSlot(slot) {
@@ -311,6 +317,15 @@ export default function LeadDetail() {
                                     </div>
                                 ))}
                             </div>
+                        ) : lead.awaiting_transcript ? (
+                            <div className="text-xs font-mono text-cyan-300 border border-cyan-500/30 bg-cyan-500/5 rounded p-3 leading-relaxed" data-testid="awaiting-transcript">
+                                Live call placed — waiting for the provider's end-of-call report.
+                                <div className="text-slate-400 mt-1">
+                                    The transcript arrives over{" "}
+                                    <span className="text-slate-200">POST /api/webhooks/vapi</span>; qualification
+                                    runs only once real conversation data lands.
+                                </div>
+                            </div>
                         ) : (
                             <div className="text-slate-500 text-sm">No conversation yet — AI is dispatching.</div>
                         )}
@@ -352,44 +367,61 @@ export default function LeadDetail() {
                             </span>
                         </div>
                         <div className="space-y-1.5 max-h-[240px] overflow-y-auto pr-2">
-                            {events.map((e) => (
-                                <div
-                                    key={e.id}
-                                    className="flex items-center gap-3 text-xs font-mono"
-                                    data-testid={`event-${e.id}`}
-                                >
-                                    <span className="text-[10px] text-slate-600 w-32 shrink-0">
-                                        {new Date(e.ts).toLocaleString(undefined, {
-                                            month: "short",
-                                            day: "numeric",
-                                            hour: "2-digit",
-                                            minute: "2-digit",
-                                            second: "2-digit",
-                                        })}
-                                    </span>
-                                    <span className="text-slate-500 uppercase text-[10px] w-20 shrink-0">
-                                        {e.kind}
-                                    </span>
-                                    <span className="text-slate-300 truncate">
-                                        {e.from_status && (
-                                            <span className="text-slate-500">
-                                                {e.from_status} →{" "}
-                                            </span>
-                                        )}
-                                        {e.to_status && (
-                                            <span
-                                                className="text-slate-100 font-semibold"
-                                                style={{ color: STATUS_META[e.to_status]?.color }}
-                                            >
-                                                {e.to_status}
-                                            </span>
-                                        )}
-                                        {e.reason && (
-                                            <span className="text-slate-500 ml-2">· {e.reason}</span>
-                                        )}
-                                    </span>
-                                </div>
-                            ))}
+                            {events.map((e) => {
+                                const failed = isErrorEvent(e);
+                                return (
+                                    <div
+                                        key={e.id}
+                                        className={`flex items-center gap-3 text-xs font-mono ${
+                                            failed
+                                                ? "bg-red-500/5 border border-red-500/25 rounded px-2 py-1 -mx-2"
+                                                : ""
+                                        }`}
+                                        data-testid={`event-${e.id}`}
+                                    >
+                                        <span className="text-[10px] text-slate-600 w-32 shrink-0">
+                                            {new Date(e.ts).toLocaleString(undefined, {
+                                                month: "short",
+                                                day: "numeric",
+                                                hour: "2-digit",
+                                                minute: "2-digit",
+                                                second: "2-digit",
+                                            })}
+                                        </span>
+                                        <span
+                                            className={`uppercase text-[10px] w-20 shrink-0 flex items-center gap-1 ${
+                                                failed ? "text-red-400 font-semibold" : "text-slate-500"
+                                            }`}
+                                        >
+                                            {failed && <Warning size={11} weight="fill" className="shrink-0" />}
+                                            {e.kind}
+                                        </span>
+                                        <span
+                                            className={`truncate ${failed ? "text-red-200" : "text-slate-300"}`}
+                                            title={e.reason || undefined}
+                                        >
+                                            {e.from_status && (
+                                                <span className="text-slate-500">
+                                                    {e.from_status} →{" "}
+                                                </span>
+                                            )}
+                                            {e.to_status && (
+                                                <span
+                                                    className="text-slate-100 font-semibold"
+                                                    style={{ color: STATUS_META[e.to_status]?.color }}
+                                                >
+                                                    {e.to_status}
+                                                </span>
+                                            )}
+                                            {e.reason && (
+                                                <span className={failed ? "text-red-300 ml-2" : "text-slate-500 ml-2"}>
+                                                    · {e.reason}
+                                                </span>
+                                            )}
+                                        </span>
+                                    </div>
+                                );
+                            })}
                         </div>
                     </div>
                 </div>

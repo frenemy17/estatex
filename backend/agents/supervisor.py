@@ -4,27 +4,27 @@ Flow:
     START -> load_history -> supervisor -> route -> {call|enrich|follow_up|escalate|wait|done}
              (escalate raises an interrupt; approve/reject resumes the graph)
 
-Each node reads/writes a dict-shaped state. Nodes call the LLM via
-Groq API (llama-3.3-70b-versatile) and fall back to deterministic
-rules if the LLM is unavailable, so the demo never breaks.
+Each node reads/writes a dict-shaped state. LLM access goes through
+``providers.llm_json``, which falls back to deterministic rules when no key is
+configured — so the graph produces the same shape of decision either way.
+
+Everything with a side effect is **injected** by ``server.py``:
+``notify`` (quiet hours + opt-out policy), ``dispatch_pipeline``, and
+``schedule_check`` (queues a real row in ``scheduled_actions``). The graph
+decides; the server persists.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-import os
-import re
-from datetime import datetime, timedelta, timezone
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Awaitable, Callable
 
-import google.generativeai as genai
-import requests
+import providers
 
 from .graph import END, MongoCheckpointer, StateGraph
 
 log = logging.getLogger("supervisor")
-EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY")
 
 VALID_ACTIONS = {"call", "enrich", "follow_up", "escalate", "wait", "done"}
 
@@ -49,56 +49,27 @@ def _make_load_history(db):
             "attempt_history": lead.get("attempt_history", []),
             "event_count": len(events),
             "opted_out": lead.get("opted_out", False),
-            "thought": f"Loaded lead status={lead['status']} score={lead.get('score', 0)} events={len(events)}",
+            "awaiting_transcript": lead.get("awaiting_transcript", False),
+            "thought": (
+                f"Loaded lead status={lead['status']} score={lead.get('score', 0)} "
+                f"events={len(events)}"
+            ),
         }
 
     return load_history
 
 
-async def _llm_json(session_id: str, system: str, prompt: str, fallback: dict) -> dict:
-    """Call LLM (Groq or Gemini) and parse a JSON blob; return fallback on any error."""
-    key = os.environ.get("GROQ_API_KEY") or os.environ.get("EMERGENT_LLM_KEY")
-    if not key:
-        return fallback
+async def _llm_json(label: str, system: str, prompt: str, fallback: dict) -> dict:
+    """Thin adapter over the shared provider LLM call.
 
-    if key.startswith("gsk_"):
-        try:
-            res = await asyncio.to_thread(
-                requests.post,
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "llama-3.3-70b-versatile",
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "response_format": {"type": "json_object"},
-                    "temperature": 0.2,
-                },
-                timeout=10,
-            )
-            data = res.json()
-            content = data["choices"][0]["message"]["content"]
-            return json.loads(content)
-        except Exception as e:  # noqa: BLE001
-            log.warning("Groq LLM call failed (%s): %s", session_id, e)
-            return fallback
-
-    try:
-        genai.configure(api_key=key)
-        model = genai.GenerativeModel("gemini-2.0-flash", system_instruction=system)
-        resp = await model.generate_content_async(prompt)
-        text = resp.text
-        cleaned = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
-        match = re.search(r"\{[\s\S]*\}", cleaned)
-        return json.loads(match.group(0) if match else cleaned)
-    except Exception as e:  # noqa: BLE001
-        log.warning("LLM fallback (%s): %s", session_id, e)
-        return fallback
+    Discards the ProviderResult: a node that can't reach the LLM should proceed
+    on its deterministic fallback rather than fail. The failure is still recorded
+    centrally in ``db.provider_health`` by the provider layer's caller.
+    """
+    data, result = await providers.llm_json(system, prompt, fallback, label=label)
+    if result.live_failure:
+        log.warning("%s: LLM unavailable (%s) — using fallback", label, result.error)
+    return data
 
 
 def _rule_based_action(state: dict) -> tuple[str, str]:
@@ -109,6 +80,8 @@ def _rule_based_action(state: dict) -> tuple[str, str]:
     if status == "NEW":
         return "call", "Fresh lead — call within 5 minutes maximizes conversion."
     if status in ("CALLING", "IN_CONVERSATION"):
+        if state.get("awaiting_transcript"):
+            return "wait", "Live call in flight; awaiting the end-of-call transcript."
         return "wait", "Conversation in progress; do not interrupt."
     if status == "HOT" or score >= 85:
         return "escalate", f"Score {score} — route to senior agent immediately."
@@ -136,10 +109,11 @@ async def supervisor_node(state: dict) -> dict:
         "HOT or score >= 85 -> escalate to senior agent; "
         "QUALIFIED -> follow_up with booking prompt; "
         "NURTURE -> enrich or follow_up; "
-        "NEW -> call. "
+        "NEW -> call; "
+        "CALLING or IN_CONVERSATION -> wait. "
         f"Pick ONE next_action from {sorted(VALID_ACTIONS)}. "
-        "Return JSON: {\"next_action\": string, \"reasoning\": string}. "
-        f"A safe default is next_action=\"{rule_action}\"."
+        'Return JSON: {"next_action": string, "reasoning": string}. '
+        f'A safe default is next_action="{rule_action}".'
     )
     fallback = {"next_action": rule_action, "reasoning": rule_reason}
     resp = await _llm_json(
@@ -164,7 +138,7 @@ def _make_enrichment_agent(db):
         prompt = (
             f"Give a two-sentence real-estate briefing on '{area}' relevant to a "
             "prospective buyer. Return JSON: "
-            "{\"area\": string, \"median_price\": string, \"hook\": string} "
+            '{"area": string, "median_price": string, "hook": string} '
             "where `hook` is one persuasive sentence a broker could reuse."
         )
         fallback = {
@@ -178,7 +152,6 @@ def _make_enrichment_agent(db):
             prompt,
             fallback,
         )
-        # Persist to lead as enrichment
         await db.leads.update_one(
             {"id": state["lead_id"]},
             {"$set": {"enrichment": data}},
@@ -193,12 +166,15 @@ def _make_enrichment_agent(db):
                 "ts": datetime.now(timezone.utc).isoformat(),
             }
         )
-        return {"enrichment": data, "thought": f"Enriched with area brief for {data.get('area')}."}
+        return {
+            "enrichment": data,
+            "thought": f"Enriched with area brief for {data.get('area')}.",
+        }
 
     return enrichment_agent
 
 
-def _make_followup_agent(db, notifier):
+def _make_followup_agent(db, notify):
     async def followup_agent(state: dict) -> dict:
         lead = await db.leads.find_one({"id": state["lead_id"]}, {"_id": 0})
         if not lead:
@@ -209,14 +185,17 @@ def _make_followup_agent(db, notifier):
         prompt = (
             f"Draft a short follow-up for a real-estate lead in status {state.get('status')} "
             f"score {state.get('score', 0)}. Qualification: {json.dumps(q)}. "
-            "Return JSON: {\"channel\": \"sms\"|\"email\", \"tone\": string, "
-            "\"subject\": string, \"body\": string, \"defer_hours\": integer}."
+            'Return JSON: {"channel": "sms"|"email", "tone": string, '
+            '"subject": string, "body": string, "defer_hours": integer}.'
         )
         fallback = {
             "channel": "sms" if state.get("score", 0) >= 60 else "email",
             "tone": "warm-professional",
             "subject": "Following up on your search",
-            "body": f"Hi {lead['name']}, wanted to circle back on {q.get('area') or 'your area'} — I have two matches.",
+            "body": (
+                f"Hi {lead['name']}, wanted to circle back on "
+                f"{q.get('area') or 'your area'} — I have two matches."
+            ),
             "defer_hours": 4 if state.get("score", 0) >= 60 else 24,
         }
         plan = await _llm_json(
@@ -225,21 +204,13 @@ def _make_followup_agent(db, notifier):
             prompt,
             fallback,
         )
-        # Delegate to notifier (respects quiet hours + opt-out)
-        # Reconstruct a minimal object with the attributes notifier reads
-        class _L:
-            pass
-        L = _L()
-        L.id = lead["id"]
-        L.name = lead["name"]
-        L.phone = lead["phone"]
-        L.email = lead.get("email")
-        result = await notifier.send(
-            L, plan.get("channel", "sms"), "supervisor_followup", plan
-        )
+        channel = plan.get("channel") if plan.get("channel") in ("sms", "email") else fallback["channel"]
+        # The injected notifier owns opt-out, quiet hours, and provider fallback,
+        # and accepts the raw lead document — no shim object needed.
+        result = await notify(lead, channel, "supervisor_followup", plan)
         return {
-            "channel": plan.get("channel"),
-            "thought": f"Sent {plan.get('channel')} follow-up ({plan.get('tone')}).",
+            "channel": channel,
+            "thought": f"Sent {channel} follow-up ({plan.get('tone')}).",
             "followup_plan": plan,
             "followup_result": result,
         }
@@ -277,14 +248,19 @@ async def escalate_action(state: dict) -> dict:
     }
 
 
-def _make_wait_action(db):
+def _make_wait_action(schedule_check: Callable[[str], Awaitable[str]]):
     async def wait_action(state: dict) -> dict:
-        next_check = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
-        await db.leads.update_one(
-            {"id": state["lead_id"]},
-            {"$set": {"next_check_at": next_check}},
-        )
-        return {"thought": f"Scheduled next supervisor check at {next_check}."}
+        """Queue a real re-check instead of writing a field nobody reads.
+
+        The old version set ``lead.next_check_at`` and stopped there, so "wait 6
+        hours" never resumed. Now it enqueues a ``scheduled_actions`` row that
+        ``POST /api/tick`` drains when it comes due.
+        """
+        run_at = await schedule_check(state["lead_id"])
+        return {
+            "thought": f"Queued next supervisor check at {run_at}.",
+            "next_check_at": run_at,
+        }
 
     return wait_action
 
@@ -300,16 +276,28 @@ def route_from_supervisor(state: dict) -> str:
 # ---------- Graph builder ----------
 
 
-def build_supervisor_graph(db, notifier, dispatch_pipeline):
-    """Build and compile the supervisor StateGraph (returns CompiledGraph)."""
+def build_supervisor_graph(
+    db,
+    notify: Callable[..., Awaitable[Any]],
+    dispatch_pipeline: Callable[[str], None],
+    schedule_check: Callable[[str], Awaitable[str]],
+):
+    """Build and compile the supervisor StateGraph (returns CompiledGraph).
+
+    Args:
+        db: Motor database handle.
+        notify: ``server.send_notification(lead, channel, template, ctx)``.
+        dispatch_pipeline: fire-and-forget voice pipeline dispatch.
+        schedule_check: enqueues a future supervisor run; returns its ISO run_at.
+    """
     g = StateGraph()
     g.add_node("load_history", _make_load_history(db))
     g.add_node("supervisor", supervisor_node)
     g.add_node("call", _make_call_action(dispatch_pipeline))
     g.add_node("enrich", _make_enrichment_agent(db))
-    g.add_node("follow_up", _make_followup_agent(db, notifier))
+    g.add_node("follow_up", _make_followup_agent(db, notify))
     g.add_node("escalate", escalate_action)
-    g.add_node("wait", _make_wait_action(db))
+    g.add_node("wait", _make_wait_action(schedule_check))
     g.add_node("done", done_action)
 
     g.set_entry_point("load_history")

@@ -783,15 +783,21 @@ function AgencyOnboardingModal({ open, onClose }) {
         try {
             await api.post("/seed");
             toast.success(`AI Concierge Deployed for ${agency.name || "your agency"}!`);
-            setTimeout(() => {
-                onClose();
-                navigate("/app");
-            }, 800);
-        } catch {
-            toast.error("Deployment failed");
-        } finally {
-            setDeploying(false);
+        } catch (e) {
+            // Seeding is admin-only; a read-only visitor still gets the tour.
+            if (e?.response?.status === 401) {
+                toast.info("Read-only demo — opening the live pipeline without seeding.");
+            } else {
+                toast.error("Deployment failed");
+                setDeploying(false);
+                return;
+            }
         }
+        setTimeout(() => {
+            onClose();
+            navigate("/app");
+        }, 800);
+        setDeploying(false);
     }
 
     return (

@@ -1,8 +1,13 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api, STATUS_META, STATUSES, scoreBand } from "../lib/api";
+import { usePoll } from "../lib/usePoll";
 import { toast } from "sonner";
 import { Button } from "../components/ui/button";
+import ProviderStatus from "../components/ProviderStatus";
+import AdminTokenButton, { useAdminToken } from "../components/AdminTokenButton";
+
+const ADMIN_HINT = "Read-only demo — add the backend ADMIN_TOKEN to enable this";
 
 export default function Dashboard() {
     const [leads, setLeads] = useState([]);
@@ -11,6 +16,7 @@ export default function Dashboard() {
     const [filterCategory, setFilterCategory] = useState("all");
     const [seeding, setSeeding] = useState(false);
     const [showCsvModal, setShowCsvModal] = useState(false);
+    const admin = useAdminToken();
     const nav = useNavigate();
 
     async function load() {
@@ -24,11 +30,7 @@ export default function Dashboard() {
         }
     }
 
-    useEffect(() => {
-        load();
-        const t = setInterval(load, 3000); // Live poll
-        return () => clearInterval(t);
-    }, []);
+    usePoll(load, 8000);
 
     async function handleSeed() {
         setSeeding(true);
@@ -36,8 +38,10 @@ export default function Dashboard() {
             const { data } = await api.post("/seed");
             toast.success(`Seeded ${data.created} new leads — AI pipeline dispatched.`);
             load();
-        } catch {
-            toast.error("Seed failed");
+        } catch (e) {
+            toast.error(
+                e?.response?.status === 401 ? "Admin token required to seed" : "Seed failed"
+            );
         } finally {
             setSeeding(false);
         }
@@ -126,6 +130,9 @@ export default function Dashboard() {
                 </div>
             </div>
 
+            {/* Live integration status — grey mock / green live / amber failing */}
+            <ProviderStatus />
+
             {/* Controls Bar: Search & Quick Filters */}
             <div className="flex flex-col sm:flex-row items-center justify-between gap-4 p-4 rounded-xl border border-slate-800/80 bg-slate-950/60 backdrop-blur-xl">
                 <div className="flex items-center gap-3 w-full sm:w-auto">
@@ -189,6 +196,7 @@ export default function Dashboard() {
 
                 {/* Actions */}
                 <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
+                    <AdminTokenButton />
                     <Button
                         onClick={() => nav("/capture")}
                         className="bg-amber-400 hover:bg-amber-300 text-slate-950 font-semibold text-xs px-4 py-2"
@@ -197,16 +205,19 @@ export default function Dashboard() {
                     </Button>
                     <Button
                         onClick={() => setShowCsvModal(true)}
+                        disabled={!admin}
+                        title={admin ? undefined : ADMIN_HINT}
                         variant="outline"
-                        className="border-slate-800 bg-slate-900/60 text-slate-200 hover:bg-slate-800 text-xs px-3 py-2"
+                        className="border-slate-800 bg-slate-900/60 text-slate-200 hover:bg-slate-800 text-xs px-3 py-2 disabled:opacity-40 disabled:cursor-not-allowed"
                     >
                         Upload CSV / Excel
                     </Button>
                     <Button
                         onClick={handleSeed}
-                        disabled={seeding}
+                        disabled={seeding || !admin}
+                        title={admin ? undefined : ADMIN_HINT}
                         variant="outline"
-                        className="border-slate-800 bg-slate-900/60 text-slate-400 hover:bg-slate-800 text-xs px-3 py-2"
+                        className="border-slate-800 bg-slate-900/60 text-slate-400 hover:bg-slate-800 text-xs px-3 py-2 disabled:opacity-40 disabled:cursor-not-allowed"
                     >
                         {seeding ? "Seeding…" : "Seed 15 Leads"}
                     </Button>
@@ -420,8 +431,12 @@ function CsvImportModal({ open, onClose, onSuccess }) {
             toast.success(`Imported ${data.imported} leads — AI qualification dispatched!`);
             onSuccess();
             onClose();
-        } catch {
-            toast.error("Bulk import failed");
+        } catch (e) {
+            toast.error(
+                e?.response?.status === 401
+                    ? "Admin token required for bulk import"
+                    : "Bulk import failed"
+            );
         } finally {
             setSubmitting(false);
         }

@@ -1,7 +1,15 @@
 """V2 supervisor + approval + opt-out + sim/eval end-to-end API tests.
 
-These tests hit the live backend via REACT_APP_BACKEND_URL and exercise the
-new endpoints introduced in iteration 2.
+These hit a **running** backend over HTTP at ``REACT_APP_BACKEND_URL`` and need
+``ADMIN_TOKEN`` for the seed/simulate/reset routes, so they are marked
+``integration`` and deselected by default (see ``pytest.ini``). Run them against
+a live server with:
+
+    uvicorn server:app --port 8000          # in one shell
+    pytest -m integration -n 0              # in another
+
+The offline equivalents live in ``test_tick.py``, which drives the same code
+paths in-process with no server and no database.
 """
 from __future__ import annotations
 
@@ -14,14 +22,16 @@ import pytest
 import requests
 from dotenv import load_dotenv
 
+pytestmark = pytest.mark.integration
+
 # Load frontend .env explicitly for REACT_APP_BACKEND_URL
 load_dotenv(Path(__file__).resolve().parents[2] / "frontend" / ".env")
 
-BASE_URL = (os.environ.get("REACT_APP_BACKEND_URL") or "").rstrip("/")
-assert BASE_URL, "REACT_APP_BACKEND_URL must be set"
+BASE_URL = (os.environ.get("REACT_APP_BACKEND_URL") or "http://localhost:8000").rstrip("/")
 API = f"{BASE_URL}/api"
 
-GOOGLE_KEY = os.environ.get("GOOGLE_LEADS_WEBHOOK_KEY", "change-me-in-google-ads")
+GOOGLE_KEY = os.environ.get("GOOGLE_LEADS_WEBHOOK_KEY", "")
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
 
 # ---------- fixtures ----------
@@ -31,6 +41,8 @@ GOOGLE_KEY = os.environ.get("GOOGLE_LEADS_WEBHOOK_KEY", "change-me-in-google-ads
 def s() -> requests.Session:
     sess = requests.Session()
     sess.headers.update({"Content-Type": "application/json"})
+    if ADMIN_TOKEN:
+        sess.headers.update({"X-Admin-Token": ADMIN_TOKEN})
     return sess
 
 

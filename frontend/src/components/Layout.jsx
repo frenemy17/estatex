@@ -4,6 +4,7 @@ import { Button } from "./ui/button";
 import { toast } from "sonner";
 import { api } from "../lib/api";
 import { useState } from "react";
+import { useAdminToken } from "./AdminTokenButton";
 
 const nav = [
     { to: "/app", label: "Pipeline", icon: SquaresFour, testid: "nav-pipeline" },
@@ -13,6 +14,7 @@ const nav = [
 export default function Layout() {
     const navigate = useNavigate();
     const [seeding, setSeeding] = useState(false);
+    const admin = useAdminToken();
 
     async function handleSeed() {
         setSeeding(true);
@@ -20,8 +22,10 @@ export default function Layout() {
             const { data } = await api.post("/seed");
             toast.success(`Seeded ${data.created} new leads — AI pipeline dispatched.`);
             setTimeout(() => navigate(0), 800);
-        } catch {
-            toast.error("Seed failed");
+        } catch (e) {
+            toast.error(
+                e?.response?.status === 401 ? "Admin token required to seed" : "Seed failed"
+            );
         } finally {
             setSeeding(false);
         }
@@ -67,9 +71,10 @@ export default function Layout() {
                 <div className="p-4 border-t border-slate-800/80">
                     <Button
                         onClick={handleSeed}
-                        disabled={seeding}
+                        disabled={seeding || !admin}
+                        title={admin ? undefined : "Read-only demo — add the backend ADMIN_TOKEN to enable this"}
                         variant="outline"
-                        className="w-full border-slate-800 bg-slate-900/40 text-slate-300 hover:bg-slate-800 hover:text-slate-50"
+                        className="w-full border-slate-800 bg-slate-900/40 text-slate-300 hover:bg-slate-800 hover:text-slate-50 disabled:opacity-40 disabled:cursor-not-allowed"
                         data-testid="btn-seed-leads"
                     >
                         {seeding ? "Seeding…" : "Seed 15 Demo Leads"}

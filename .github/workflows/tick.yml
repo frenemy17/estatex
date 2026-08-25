@@ -1,0 +1,74 @@
+name: Autonomy tick
+
+# The scheduler. POST /api/tick is one idempotent pass over db.scheduled_actions:
+# it fires due follow-ups, re-sends notifications that were held for quiet hours,
+# and rescues leads stranded in CALLING past CALL_TIMEOUT_MINUTES. Running it on
+# a cron is what makes "wait 6 hours, then follow up" true rather than aspirational.
+#
+# It also doubles as the keep-warm ping for a free-tier Render service, which
+# spins down after ~15 minutes idle.
+#
+# Setup (Settings -> Secrets and variables -> Actions):
+#   Variable  BACKEND_URL   https://your-service.onrender.com
+#   Secret    ADMIN_TOKEN   the same value as the backend's ADMIN_TOKEN
+# Without both, the job no-ops instead of failing, so forks stay green.
+
+on:
+  schedule:
+    # Every 10 minutes. GitHub delays scheduled runs under load, which is fine:
+    # the tick is idempotent, so a late or doubled run changes nothing.
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: autonomy-tick
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: POST /api/tick
+        env:
+          BACKEND_URL: ${{ vars.BACKEND_URL }}
+          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BACKEND_URL:-}" ] || [ -z "${ADMIN_TOKEN:-}" ]; then
+            echo "::notice::BACKEND_URL variable or ADMIN_TOKEN secret not set — skipping."
+            exit 0
+          fi
+
+          # A cold Render instance takes ~50s to wake, so allow for that and retry
+          # a refused connection rather than reporting a false failure.
+          response=$(curl -sS -o body.json -w '%{http_code}' \
+            --max-time 120 \
+            --retry 3 --retry-delay 15 --retry-connrefused \
+            -X POST "${BACKEND_URL%/}/api/tick" \
+            -H "X-Admin-Token: ${ADMIN_TOKEN}" \
+            -H "Content-Length: 0")
+
+          echo "HTTP ${response}"
+          cat body.json
+          echo
+
+          if [ "$response" != "200" ]; then
+            echo "::error::tick failed with HTTP ${response}"
+            exit 1
+          fi
+
+          # Surface the summary on the run page: what the tick actually did.
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          with open("body.json") as fh:
+              d = json.load(fh)
+          print("### Autonomy tick\n")
+          print(f"- ran at `{d.get('ran_at')}` in {d.get('took_ms')} ms")
+          print(f"- scheduled actions drained: **{d.get('drained', 0)}** "
+                f"(failed: {d.get('failed', 0)})")
+          print(f"- stuck calls rescued: **{d.get('rescued', 0)}**")
+          print(f"- leads requalified: **{d.get('requalified', 0)}**")
+          for a in d.get("actions", []):
+              print(f"  - `{a.get('kind')}` → {a.get('lead_id')}: {a.get('result')}")
+          PY

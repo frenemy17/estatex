@@ -84,6 +84,9 @@ frontend/node_modules/.cache/default-development/5.pack
 .env
 .env.*
 *.env
+# ...but the documented template must be committed.
+!.env.example
+!**/.env.example
 credentials.json
 *.key
 .credentials

@@ -1,30 +1,54 @@
-"""AI Real-Estate Lead Qualifier — FastAPI backend.
+"""EstateX — AI real-estate lead concierge. FastAPI backend.
 
-Deterministic backbone: state machine + audit log.
-Agentic layer: LLM qualification via Groq API (llama-3.3-70b-versatile).
-Providers (Voice, Booking, Notification, CRM) are mocked but pluggable.
+Three layers, deliberately separated:
+
+* **Deterministic backbone** — the ``ALLOWED_TRANSITIONS`` state machine plus an
+  append-only event log. Every status change goes through :func:`transition`, so
+  the audit trail can never disagree with the lead's state.
+* **Agentic layer** — LLM qualification and a LangGraph-style supervisor graph
+  with Mongo checkpointing (``agents/``).
+* **Providers** — ``providers.py``. Absent keys run a mock; present keys run the
+  real API and report the real HTTP status. Nothing claims a success it did not
+  get.
+
+Autonomy comes from ``db.scheduled_actions`` + ``POST /api/tick``: anything that
+says "later" (supervisor waits, quiet-hours deferrals) enqueues a row, and the
+tick drains what is due and rescues leads stuck mid-call. A cron hitting /tick is
+what makes the "24/7" claim true.
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
-import random
 import re
+import secrets
+import time
 import uuid
+from collections import defaultdict, deque
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal, Optional
 
 import certifi
 from dotenv import load_dotenv
-import google.generativeai as genai
-import requests
-from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Request,
+    Response,
+)
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from starlette.middleware.cors import CORSMiddleware
+
+import providers
+from providers import ProviderResult
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -33,20 +57,15 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-log = logging.getLogger("lead-qualifier")
+log = logging.getLogger("estatex")
 
-# ---------- DB ----------
-mongo_url = os.environ["MONGO_URL"]
-client_kwargs = {}
-if "mongodb+srv" in mongo_url:
-    client_kwargs["tlsCAFile"] = certifi.where()
-client = AsyncIOMotorClient(mongo_url, **client_kwargs)
-db = client[os.environ["DB_NAME"]]
-
-EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY")
-GOOGLE_LEADS_WEBHOOK_KEY = os.environ.get("GOOGLE_LEADS_WEBHOOK_KEY", "change-me-in-google-ads")
-QUIET_HOURS_START = int(os.environ.get("QUIET_HOURS_START", "21"))  # 9pm UTC
-QUIET_HOURS_END = int(os.environ.get("QUIET_HOURS_END", "8"))  # 8am UTC
+for handler in logging.getLogger().handlers:
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s [lead=%(lead_id)s] %(name)s %(levelname)s %(message)s",
+            defaults={"lead_id": "-"},
+        )
+    )
 
 
 def clog(lead_id: str | None = None) -> logging.LoggerAdapter:
@@ -54,14 +73,84 @@ def clog(lead_id: str | None = None) -> logging.LoggerAdapter:
     return logging.LoggerAdapter(log, {"lead_id": lead_id or "-"})
 
 
-# Patch base formatter to include lead_id when present
-for handler in logging.getLogger().handlers:
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s [lead=%(lead_id)s] %(name)s %(levelname)s %(message)s", defaults={"lead_id": "-"})
-    )
+def now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-# ---------- Constants: state machine ----------
+def now_iso() -> str:
+    return now().isoformat()
+
+
+def _flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+# ---------- DB (lazy) ----------
+#
+# Resolved on first use rather than at import. A missing MONGO_URL used to take
+# the whole app down at import time with an opaque 500 and no /health output; now
+# the app boots, /api/health reports the problem, and `pytest` can import this
+# module without a database.
+
+_client: AsyncIOMotorClient | None = None
+_db = None
+
+
+def get_db():
+    global _client, _db
+    if _db is None:
+        url = os.environ.get("MONGO_URL")
+        if not url:
+            raise RuntimeError(
+                "MONGO_URL is not set. Copy backend/.env.example to backend/.env "
+                "and set MONGO_URL + DB_NAME."
+            )
+        kwargs: dict[str, Any] = {"serverSelectionTimeoutMS": 8000}
+        if "mongodb+srv" in url:
+            # Atlas needs an explicit CA bundle on many macOS/Linux Python builds.
+            kwargs["tlsCAFile"] = certifi.where()
+        _client = AsyncIOMotorClient(url, **kwargs)
+        _db = _client[os.environ.get("DB_NAME", "estatex_db")]
+    return _db
+
+
+def close_db() -> None:
+    global _client, _db
+    if _client is not None:
+        _client.close()
+    _client, _db = None, None
+
+
+class _DBProxy:
+    """Deferred handle so ``db.leads`` and ``db["x"]`` work before connect."""
+
+    def __getattr__(self, name: str):
+        return getattr(get_db(), name)
+
+    def __getitem__(self, name: str):
+        return get_db()[name]
+
+
+db = _DBProxy()
+
+
+# ---------- Config ----------
+
+GOOGLE_LEADS_WEBHOOK_KEY = os.environ.get("GOOGLE_LEADS_WEBHOOK_KEY")
+QUIET_HOURS_ENABLED = _flag("QUIET_HOURS_ENABLED", True)
+QUIET_HOURS_START = int(os.environ.get("QUIET_HOURS_START", "21"))  # 9pm UTC
+QUIET_HOURS_END = int(os.environ.get("QUIET_HOURS_END", "8"))  # 8am UTC
+# How long a lead may sit in CALLING/IN_CONVERSATION before /tick rescues it.
+CALL_TIMEOUT_MINUTES = int(os.environ.get("CALL_TIMEOUT_MINUTES", "20"))
+SUPERVISOR_WAIT_HOURS = int(os.environ.get("SUPERVISOR_WAIT_HOURS", "6"))
+LEAD_RATE_LIMIT_PER_MIN = int(os.environ.get("LEAD_RATE_LIMIT_PER_MIN", "10"))
+
+
+# ---------- State machine ----------
+
 LeadStatus = Literal[
     "NEW", "CALLING", "IN_CONVERSATION", "QUALIFIED", "NURTURE", "HOT", "BOOKED"
 ]
@@ -79,22 +168,11 @@ ALLOWED_TRANSITIONS: dict[str, set[str]] = {
 QUALIFICATION_RUBRIC = {
     "threshold_qualified": 70,
     "threshold_nurture": 40,
-    "weights": {
-        "intent": 25,
-        "budget": 25,
-        "timeline": 20,
-        "financing": 15,
-        "area": 15,
-    },
+    "weights": {"intent": 25, "budget": 25, "timeline": 20, "financing": 15, "area": 15},
 }
 
-QUESTIONS = [
-    "What kind of property are you looking for (buy, rent, invest)?",
-    "What is your approximate budget range?",
-    "What is your timeline — are you looking to move in the next few months?",
-    "Do you already have financing/pre-approval in place?",
-    "Which neighborhoods or areas are you focused on?",
-]
+QUESTIONS = providers.QUESTIONS
+
 
 # ---------- Models ----------
 
@@ -128,8 +206,15 @@ class Lead(BaseDoc):
     opted_out: bool = False
     pending_approval: bool = False
     next_check_at: Optional[str] = None
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    # Set when a real Vapi call is in flight and we are waiting on the
+    # end-of-call-report webhook to deliver the transcript.
+    voice_call_id: Optional[str] = None
+    awaiting_transcript: bool = False
+    # Pins which scripted mock conversation this lead gets. Only set by
+    # /api/simulate, so the eval sweep covers every profile exactly.
+    sim_profile: Optional[int] = None
+    created_at: datetime = Field(default_factory=now)
+    updated_at: datetime = Field(default_factory=now)
 
 
 class LeadCreate(BaseModel):
@@ -142,12 +227,14 @@ class LeadCreate(BaseModel):
 
 class Event(BaseDoc):
     lead_id: str
-    kind: str  # transition | note | call | booking | followup | supervisor
+    # transition | note | call | booking | followup | supervisor | enrichment
+    # | provider | error
+    kind: str
     from_status: Optional[str] = None
     to_status: Optional[str] = None
     reason: str = ""
     meta: dict[str, Any] = Field(default_factory=dict)
-    ts: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    ts: datetime = Field(default_factory=now)
 
 
 class Appointment(BaseDoc):
@@ -155,15 +242,34 @@ class Appointment(BaseDoc):
     slot_iso: str
     duration_min: int = 30
     provider: str = "mock-calcom"
+    external_id: Optional[str] = None
     status: str = "BOOKED"
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=now)
+
+
+class ScheduledAction(BaseDoc):
+    """A promise to do something later. Drained by :func:`run_tick`.
+
+    This collection is what turns "wait 6 hours" and "deferred until 08:00" from
+    a logged intention into an action that actually happens.
+    """
+
+    lead_id: str
+    kind: str  # supervisor | notify
+    run_at: str  # ISO-8601 UTC; compared lexicographically
+    payload: dict[str, Any] = Field(default_factory=dict)
+    state: str = "PENDING"  # PENDING | RUNNING | DONE | FAILED
+    attempts: int = 0
+    error: Optional[str] = None
+    reason: str = ""
+    created_at: datetime = Field(default_factory=now)
 
 
 class BookSlotRequest(BaseModel):
     slot_iso: str
 
 
-# ---------- Serialization helpers ----------
+# ---------- Serialization ----------
 
 
 def to_mongo(doc: BaseModel) -> dict:
@@ -187,7 +293,49 @@ def from_mongo(cls, doc: dict):
     return cls(**d)
 
 
-# ---------- State machine ----------
+# ---------- Auth ----------
+
+
+async def require_admin(
+    x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token"),
+) -> bool:
+    """Guard destructive and expensive routes.
+
+    Deliberately fails closed: with no ``ADMIN_TOKEN`` configured, admin routes
+    are unreachable rather than open. A public deploy therefore starts read-only.
+    """
+    expected = os.environ.get("ADMIN_TOKEN")
+    if not expected:
+        raise HTTPException(
+            401,
+            "Admin routes are locked because ADMIN_TOKEN is not set on the server.",
+        )
+    if not x_admin_token or not secrets.compare_digest(x_admin_token, expected):
+        raise HTTPException(401, "Invalid or missing X-Admin-Token")
+    return True
+
+
+_rate_buckets: dict[str, deque[float]] = defaultdict(deque)
+
+
+def rate_limit(request: Request, bucket: str = "lead", per_min: int | None = None) -> None:
+    """Per-IP sliding window. The public capture form reaches the LLM, so an
+    unthrottled endpoint is a billing hole as much as an abuse one."""
+    limit = per_min if per_min is not None else LEAD_RATE_LIMIT_PER_MIN
+    if limit <= 0:
+        return
+    ip = (request.client.host if request.client else "unknown") or "unknown"
+    key = f"{bucket}:{ip}"
+    window = _rate_buckets[key]
+    cutoff = time.monotonic() - 60
+    while window and window[0] < cutoff:
+        window.popleft()
+    if len(window) >= limit:
+        raise HTTPException(429, f"Rate limit: max {limit} requests/minute")
+    window.append(time.monotonic())
+
+
+# ---------- Events + transitions ----------
 
 
 async def record_event(
@@ -209,6 +357,10 @@ async def record_event(
     await db.events.insert_one(to_mongo(ev))
 
 
+def is_legal(current: str, target: str) -> bool:
+    return target == current or target in ALLOWED_TRANSITIONS.get(current, set())
+
+
 async def transition(lead_id: str, new_status: str, reason: str = "") -> Lead:
     lead_doc = await db.leads.find_one({"id": lead_id})
     if not lead_doc:
@@ -216,345 +368,465 @@ async def transition(lead_id: str, new_status: str, reason: str = "") -> Lead:
     lead = from_mongo(Lead, lead_doc)
     if new_status == lead.status:
         return lead
-    if new_status not in ALLOWED_TRANSITIONS.get(lead.status, set()):
-        raise HTTPException(
-            400,
-            f"Illegal transition {lead.status} -> {new_status}",
-        )
+    if not is_legal(lead.status, new_status):
+        raise HTTPException(400, f"Illegal transition {lead.status} -> {new_status}")
     old = lead.status
     lead.status = new_status  # type: ignore[assignment]
-    lead.updated_at = datetime.now(timezone.utc)
+    lead.updated_at = now()
     await db.leads.update_one(
         {"id": lead_id},
         {"$set": {"status": new_status, "updated_at": lead.updated_at.isoformat()}},
     )
     await record_event(lead_id, "transition", old, new_status, reason)
-    log.info("lead=%s transition %s -> %s (%s)", lead_id, old, new_status, reason)
+    clog(lead_id).info("transition %s -> %s (%s)", old, new_status, reason)
     return lead
 
 
-# ---------- Providers (mocked, pluggable) ----------
+async def touch(lead_id: str, **fields: Any) -> None:
+    """Update lead fields and bump ``updated_at`` (which /tick uses for timeouts)."""
+    fields["updated_at"] = now_iso()
+    await db.leads.update_one({"id": lead_id}, {"$set": fields})
 
 
-class VoiceProvider:
-    async def start_call(self, lead: Lead) -> dict:
-        vapi_key = os.environ.get("VAPI_API_KEY")
-        phone_id = os.environ.get("VAPI_PHONE_NUMBER_ID")
-        assistant_id = os.environ.get("VAPI_ASSISTANT_ID")
-        
-        if vapi_key and phone_id:
-            try:
-                payload = {
-                    "phoneNumberId": phone_id,
-                    "customer": {"number": lead.phone, "name": lead.name},
-                }
-                if assistant_id:
-                    payload["assistantId"] = assistant_id
-                else:
-                    payload["assistant"] = {
-                        "firstMessage": f"Hi {lead.name}, this is Ava from EstateX Realty. Do you have a moment to discuss your home search?",
-                        "model": {
-                            "provider": "groq",
-                            "model": "llama-3.3-70b-versatile",
-                            "messages": [
-                                {
-                                    "role": "system",
-                                    "content": "You are Ava, a real-estate concierge for EstateX Realty. Qualify the buyer by asking property type (buy, rent, invest), budget, timeline, financing pre-approval, and target neighborhood."
-                                }
-                            ]
-                        }
-                    }
+# ---------- Provider glue ----------
+#
+# Providers are pure I/O. Persistence of what they did lives here: one row per
+# provider in db.provider_health (drives the dashboard chips) and, when a lead is
+# involved, one event in the audit log.
 
-                res = await asyncio.to_thread(
-                    requests.post,
-                    "https://api.vapi.ai/call/phone",
-                    headers={
-                        "Authorization": f"Bearer {vapi_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                    timeout=10,
-                )
-                data = res.json()
-                log.info("vapi call dispatched: %s", data.get("id"))
-                return {"transcript": [], "provider": "vapi", "call_id": data.get("id")}
-            except Exception as e:
-                log.warning("vapi call failed, falling back to mock: %s", e)
 
-        # Mock a realistic sample transcript
-        samples = [
-            {
-                "budget": "$650k-750k",
-                "intent": "buy primary residence",
-                "timeline": "next 2 months",
-                "financing": "pre-approved",
-                "area": "Downtown / East Village",
+async def record_provider(
+    result: ProviderResult,
+    lead_id: str | None = None,
+    reason: str = "",
+    kind: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> ProviderResult:
+    await db.provider_health.update_one(
+        {"_id": result.spec},
+        {
+            "$set": {
+                "mode": result.mode,
+                "ok": result.ok,
+                "status": result.status,
+                "error": result.error,
+                "provider": result.provider,
+                "at": now_iso(),
             },
-            {
-                "budget": "$300k",
-                "intent": "investment property",
-                "timeline": "just researching",
-                "financing": "not yet",
-                "area": "Suburbs",
-            },
-            {
-                "budget": "$1.2M",
-                "intent": "buy family home",
-                "timeline": "urgent, within 30 days",
-                "financing": "cash buyer",
-                "area": "Riverside, Oak Park",
-            },
-            {
-                "budget": "unsure",
-                "intent": "rent",
-                "timeline": "6+ months",
-                "financing": "renting",
-                "area": "undecided",
-            },
-        ]
-        s = random.choice(samples)
-        transcript = [
-            {"role": "agent", "text": f"Hi {lead.name}, this is Ava from EstateX Realty."},
-            {"role": "lead", "text": "Sure, go ahead."},
-            {"role": "agent", "text": QUESTIONS[0]},
-            {"role": "lead", "text": s["intent"]},
-            {"role": "agent", "text": QUESTIONS[1]},
-            {"role": "lead", "text": s["budget"]},
-            {"role": "agent", "text": QUESTIONS[2]},
-            {"role": "lead", "text": s["timeline"]},
-            {"role": "agent", "text": QUESTIONS[3]},
-            {"role": "lead", "text": s["financing"]},
-            {"role": "agent", "text": QUESTIONS[4]},
-            {"role": "lead", "text": s["area"]},
-        ]
-        return {"transcript": transcript, "provider": "mock-vapi"}
+            "$inc": {"calls": 1, "failures": 0 if result.ok else 1},
+        },
+        upsert=True,
+    )
+    if lead_id and (reason or not result.ok):
+        meta = {**result.to_meta(), **(extra or {})}
+        await record_event(
+            lead_id,
+            kind or ("provider" if result.ok else "error"),
+            reason=reason or f"{result.spec}.failed",
+            meta=meta,
+        )
+    if result.live_failure:
+        clog(lead_id).warning(
+            "%s LIVE failure status=%s error=%s", result.spec, result.status, result.error
+        )
+    return result
 
 
-class BookingProvider:
-    async def get_slots(self, lead_id: str) -> list[str]:
-        cal_key = os.environ.get("CAL_API_KEY")
-        event_type_id = os.environ.get("CAL_EVENT_TYPE_ID")
-
-        if cal_key and event_type_id:
-            try:
-                start = datetime.now(timezone.utc).isoformat()
-                end = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
-                res = await asyncio.to_thread(
-                    requests.get,
-                    f"https://api.cal.com/v1/slots?apiKey={cal_key}&eventTypeId={event_type_id}&startTime={start}&endTime={end}",
-                    timeout=10,
-                )
-                data = res.json()
-                slots = [s["start"] for day in data.get("slots", {}).values() for s in day]
-                if slots:
-                    return slots[:9]
-            except Exception as e:
-                log.warning("cal.com slots failed, falling back to mock: %s", e)
-
-        now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-        return [
-            (now + timedelta(days=d, hours=h)).isoformat()
-            for d in (1, 2, 3)
-            for h in (10, 14, 16)
-        ]
-
-    async def book(self, lead_id: str, slot_iso: str) -> Appointment:
-        cal_key = os.environ.get("CAL_API_KEY")
-        event_type_id = os.environ.get("CAL_EVENT_TYPE_ID")
-        provider_name = "mock-calcom"
-
-        if cal_key and event_type_id:
-            try:
-                lead_doc = await db.leads.find_one({"id": lead_id})
-                res = await asyncio.to_thread(
-                    requests.post,
-                    f"https://api.cal.com/v1/bookings?apiKey={cal_key}",
-                    json={
-                        "eventTypeId": int(event_type_id),
-                        "start": slot_iso,
-                        "responses": {
-                            "name": lead_doc.get("name", "Lead"),
-                            "email": lead_doc.get("email", "lead@example.com"),
-                        },
-                    },
-                    timeout=10,
-                )
-                if res.status_code in (200, 201):
-                    provider_name = "cal.com"
-            except Exception as e:
-                log.warning("cal.com booking failed, falling back to mock: %s", e)
-
-        appt = Appointment(lead_id=lead_id, slot_iso=slot_iso, provider=provider_name)
-        await db.appointments.insert_one(to_mongo(appt))
-        return appt
+def in_quiet_hours(at: datetime | None = None) -> bool:
+    if not QUIET_HOURS_ENABLED:
+        return False
+    h = (at or now()).hour
+    if QUIET_HOURS_START <= QUIET_HOURS_END:
+        return QUIET_HOURS_START <= h < QUIET_HOURS_END
+    return h >= QUIET_HOURS_START or h < QUIET_HOURS_END
 
 
-class NotificationProvider:
-    def _in_quiet_hours(self) -> bool:
-        h = datetime.now(timezone.utc).hour
-        if QUIET_HOURS_START <= QUIET_HOURS_END:
-            return QUIET_HOURS_START <= h < QUIET_HOURS_END
-        return h >= QUIET_HOURS_START or h < QUIET_HOURS_END
+def quiet_hours_end_at(at: datetime | None = None) -> datetime:
+    ref = at or now()
+    # `% 24` so a config of QUIET_HOURS_END=24 means midnight rather than crashing.
+    target = ref.replace(hour=QUIET_HOURS_END % 24, minute=0, second=0, microsecond=0)
+    if target <= ref:
+        target += timedelta(days=1)
+    return target
 
-    async def send(
-        self, lead, channel: str, template: str, ctx: dict | None = None
-    ) -> dict:
-        lead_id = getattr(lead, "id", None) or (lead.get("id") if isinstance(lead, dict) else None)
-        # Enforce opt-out
-        doc = await db.leads.find_one({"id": lead_id}, {"opted_out": 1})
-        if doc and doc.get("opted_out"):
-            await record_event(
-                lead_id, "followup", reason=f"{channel}/{template}",
-                meta={"blocked": "opted_out", "provider": "notifier"},
-            )
-            return {"blocked": "opted_out"}
 
-        # Enforce quiet hours
-        if self._in_quiet_hours():
-            defer_until = datetime.now(timezone.utc).replace(hour=QUIET_HOURS_END, minute=0, second=0, microsecond=0)
-            if defer_until < datetime.now(timezone.utc):
-                defer_until += timedelta(days=1)
-            payload = {
+def _lead_fields(lead: Any) -> dict[str, Any]:
+    """Accept a Lead, a raw Mongo dict, or anything with the right attributes."""
+    if isinstance(lead, dict):
+        return lead
+    return {
+        "id": getattr(lead, "id", None),
+        "name": getattr(lead, "name", None),
+        "phone": getattr(lead, "phone", None),
+        "email": getattr(lead, "email", None),
+    }
+
+
+async def send_notification(
+    lead: Any, channel: str, template: str, ctx: dict | None = None
+) -> dict:
+    """Send an SMS or email under the compliance rules.
+
+    Policy order — opt-out, then quiet hours, then transport:
+
+    * opted out  -> blocked, recorded, nothing sent.
+    * quiet hours -> enqueued in ``scheduled_actions`` for the moment the window
+      opens. The previous version logged a ``deferred_until`` and dropped the
+      message on the floor; now /tick actually sends it.
+    * otherwise   -> real provider if configured, mock if not. A LIVE failure is
+      recorded as a failure *and then* retried through the mock, so the audit log
+      shows both the attempt and the fallback.
+    """
+    f = _lead_fields(lead)
+    lead_id = f.get("id")
+    name = f.get("name") or "there"
+
+    doc = await db.leads.find_one({"id": lead_id}, {"opted_out": 1})
+    if doc and doc.get("opted_out"):
+        await record_event(
+            lead_id,
+            "followup",
+            reason=f"{channel}/{template}/blocked",
+            meta={"blocked": "opted_out", "provider": "notifier"},
+        )
+        return {"blocked": "opted_out"}
+
+    ctx = ctx or {}
+    subject = ctx.get("subject") or "Your property search"
+    body = ctx.get("body") or (
+        f"Hi {name}, following up on your property search — I have a couple of "
+        "matches I'd like to show you."
+    )
+
+    if in_quiet_hours():
+        run_at = quiet_hours_end_at()
+        action = await schedule_action(
+            lead_id,
+            "notify",
+            run_at,
+            payload={"channel": channel, "template": template, "ctx": ctx},
+            reason=f"{channel}/{template}/quiet_hours",
+        )
+        await record_event(
+            lead_id,
+            "followup",
+            reason=f"{channel}/{template}/deferred",
+            meta={
+                "deferred_until": run_at.isoformat(),
+                "scheduled_action_id": action.id,
+                "provider": "notifier",
                 "channel": channel,
                 "template": template,
-                "deferred_until": defer_until.isoformat(),
-                "provider": "notifier",
-                "ctx": ctx or {},
-            }
-            await record_event(
-                lead_id, "followup", meta=payload, reason=f"{channel}/{template}/deferred"
-            )
-            return payload
-
-        provider_used = "mock-notif"
-        recipient = getattr(lead, "phone", None) if channel == "sms" else getattr(lead, "email", None)
-
-        # Real Email via Resend
-        if channel == "email" and os.environ.get("RESEND_API_KEY"):
-            try:
-                resend_key = os.environ["RESEND_API_KEY"]
-                from_email = os.environ.get("FROM_EMAIL", "onboarding@resend.dev")
-                body = (ctx or {}).get("body", f"Hello {(getattr(lead, 'name', 'there'))}, following up on your property search.")
-                subject = (ctx or {}).get("subject", "Real Estate Update")
-                res = await asyncio.to_thread(
-                    requests.post,
-                    "https://api.resend.com/emails",
-                    headers={"Authorization": f"Bearer {resend_key}", "Content-Type": "application/json"},
-                    json={"from": from_email, "to": [recipient], "subject": subject, "html": f"<p>{body}</p>"},
-                    timeout=10,
-                )
-                if res.status_code in (200, 201):
-                    provider_used = "resend"
-            except Exception as e:
-                log.warning("resend email failed: %s", e)
-
-        # Real SMS via Twilio
-        elif channel == "sms" and os.environ.get("TWILIO_ACCOUNT_SID") and os.environ.get("TWILIO_AUTH_TOKEN"):
-            try:
-                sid = os.environ["TWILIO_ACCOUNT_SID"]
-                token = os.environ["TWILIO_AUTH_TOKEN"]
-                from_phone = os.environ["TWILIO_PHONE_NUMBER"]
-                body = (ctx or {}).get("body", f"Hi {(getattr(lead, 'name', 'there'))}, thanks for reaching out to EstateX Realty!")
-                res = await asyncio.to_thread(
-                    requests.post,
-                    f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json",
-                    auth=(sid, token),
-                    data={"From": from_phone, "To": recipient, "Body": body},
-                    timeout=10,
-                )
-                if res.status_code in (200, 201):
-                    provider_used = "twilio"
-            except Exception as e:
-                log.warning("twilio sms failed: %s", e)
-
-        payload = {
+            },
+        )
+        return {
+            "deferred_until": run_at.isoformat(),
+            "scheduled_action_id": action.id,
             "channel": channel,
             "template": template,
-            "to": recipient,
-            "sent_at": datetime.now(timezone.utc).isoformat(),
-            "provider": provider_used,
-            "ctx": ctx or {},
         }
-        await record_event(
-            lead_id, "followup", meta=payload, reason=f"{channel}/{template}"
+
+    if channel == "sms":
+        result = await providers.notifier.send_sms(to=f.get("phone"), body=body)
+    else:
+        result = await providers.notifier.send_email(
+            to=f.get("email"), subject=subject, body=body
         )
-        return payload
+
+    if result.live_failure:
+        await record_provider(
+            result, lead_id, reason=f"{channel}/{template}/provider_failed", kind="error"
+        )
+        # Fall back so the pipeline still advances, but as a *separate* recorded
+        # result — the log never shows a live send that did not happen.
+        result = ProviderResult(
+            spec=result.spec,
+            provider=f"mock-{result.spec}",
+            mode="MOCK",
+            ok=True,
+            data={"fallback_after": result.status},
+        )
+
+    payload = {
+        "channel": channel,
+        "template": template,
+        "to": result.data.get("to") or f.get("phone" if channel == "sms" else "email"),
+        "sent_at": now_iso(),
+        **result.to_meta(),
+        "ctx": ctx,
+    }
+    await record_provider(result, lead_id=None)
+    await record_event(
+        lead_id, "followup", reason=f"{channel}/{template}", meta=payload
+    )
+    return payload
 
 
-class CRMProvider:
-    async def upsert_contact(self, lead: Lead) -> dict:
-        token = os.environ.get("HUBSPOT_ACCESS_TOKEN")
-        if token:
+async def fetch_slots(lead_id: str | None = None) -> dict:
+    result = await providers.booker.get_slots()
+    if result.live_failure:
+        await record_provider(
+            result, lead_id, reason="calcom.slots_failed", kind="error"
+        )
+        return {
+            "slots": providers.mock_slots(),
+            "provider": "mock-calcom",
+            "mode": "MOCK",
+            "degraded": True,
+            "error": result.error,
+            "status": result.status,
+        }
+    await record_provider(result, lead_id=None)
+    return {
+        "slots": result.data.get("slots", []),
+        "provider": result.provider,
+        "mode": result.mode,
+        "degraded": False,
+    }
+
+
+async def sync_crm(lead: Lead) -> None:
+    contact = await providers.crm.upsert_contact(
+        name=lead.name, phone=lead.phone, email=lead.email
+    )
+    await record_provider(
+        contact,
+        lead.id,
+        reason="crm.contact_upserted" if contact.ok else "crm.contact_failed",
+        kind="note" if contact.ok else "error",
+    )
+    if lead.status not in ("QUALIFIED", "HOT"):
+        return
+    deal = await providers.crm.create_deal(
+        name=lead.name,
+        status=lead.status,
+        score=lead.score,
+        contact_id=contact.data.get("contact_id"),
+    )
+    await record_provider(
+        deal,
+        lead.id,
+        reason="crm.deal_created" if deal.ok else "crm.deal_failed",
+        kind="note" if deal.ok else "error",
+        extra={"score": lead.score},
+    )
+
+
+# ---------- Scheduled actions ----------
+
+
+async def schedule_action(
+    lead_id: str,
+    kind: str,
+    run_at: datetime,
+    payload: dict | None = None,
+    reason: str = "",
+) -> ScheduledAction:
+    action = ScheduledAction(
+        lead_id=lead_id,
+        kind=kind,
+        run_at=run_at.isoformat(),
+        payload=payload or {},
+        reason=reason,
+    )
+    await db.scheduled_actions.insert_one(to_mongo(action))
+    clog(lead_id).info("scheduled %s at %s (%s)", kind, action.run_at, reason)
+    return action
+
+
+async def _run_scheduled(doc: dict) -> str:
+    """Execute one due action. Returns a short label for the tick summary."""
+    kind = doc.get("kind")
+    lead_id = doc["lead_id"]
+    payload = doc.get("payload") or {}
+
+    if kind == "supervisor":
+        await run_supervisor(lead_id)
+        return "supervisor"
+
+    if kind == "notify":
+        lead_doc = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+        if not lead_doc:
+            return "notify:lead_missing"
+        await send_notification(
+            lead_doc,
+            payload.get("channel", "email"),
+            payload.get("template", "nurture_sequence"),
+            payload.get("ctx"),
+        )
+        return "notify"
+
+    raise ValueError(f"unknown scheduled action kind: {kind}")
+
+
+async def run_tick(limit: int = 25) -> dict:
+    """One idempotent autonomy pass. This is the whole scheduler.
+
+    1. drain due ``scheduled_actions``
+    2. rescue leads stranded mid-call (a serverless freeze or a dropped Vapi
+       webhook would otherwise leave them in CALLING forever)
+
+    Safe to run concurrently: each action is claimed with a conditional update,
+    so two overlapping ticks cannot run the same row twice.
+    """
+    started = now()
+    summary: dict[str, Any] = {
+        "ran_at": started.isoformat(),
+        "drained": 0,
+        "failed": 0,
+        "rescued": 0,
+        "requalified": 0,
+        "actions": [],
+    }
+
+    due = (
+        await db.scheduled_actions.find(
+            {"state": "PENDING", "run_at": {"$lte": started.isoformat()}}
+        )
+        .sort("run_at", 1)
+        .to_list(limit)
+    )
+
+    for doc in due:
+        claim = await db.scheduled_actions.update_one(
+            {"id": doc["id"], "state": "PENDING"},
+            {"$set": {"state": "RUNNING", "started_at": now_iso()}, "$inc": {"attempts": 1}},
+        )
+        if not claim.modified_count:
+            continue  # another tick claimed it
+        try:
+            label = await _run_scheduled(doc)
+            await db.scheduled_actions.update_one(
+                {"id": doc["id"]},
+                {"$set": {"state": "DONE", "finished_at": now_iso(), "error": None}},
+            )
+            summary["drained"] += 1
+            summary["actions"].append(
+                {"lead_id": doc["lead_id"], "kind": doc.get("kind"), "result": label}
+            )
+        except Exception as e:  # noqa: BLE001
+            clog(doc["lead_id"]).exception("scheduled action failed: %s", e)
+            await db.scheduled_actions.update_one(
+                {"id": doc["id"]},
+                {"$set": {"state": "FAILED", "finished_at": now_iso(), "error": str(e)}},
+            )
+            await record_event(
+                doc["lead_id"],
+                "error",
+                reason=f"scheduled.{doc.get('kind')}_failed",
+                meta={"error": str(e)[:500], "action_id": doc["id"]},
+            )
+            summary["failed"] += 1
+
+    cutoff = (started - timedelta(minutes=CALL_TIMEOUT_MINUTES)).isoformat()
+    stuck = await db.leads.find(
+        {"status": {"$in": ["CALLING", "IN_CONVERSATION"]}, "updated_at": {"$lt": cutoff}},
+        {"_id": 0},
+    ).to_list(50)
+
+    for doc in stuck:
+        lead_id = doc["id"]
+        if doc.get("transcript"):
+            # A transcript landed but qualification never ran (process died
+            # mid-pipeline). Resume rather than discard the conversation.
             try:
-                first = lead.name.split()[0] if lead.name else ""
-                last = " ".join(lead.name.split()[1:]) if len(lead.name.split()) > 1 else ""
-                res = await asyncio.to_thread(
-                    requests.post,
-                    "https://api.hubspot.com/crm/v3/objects/contacts",
-                    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                    json={
-                        "properties": {
-                            "firstname": first,
-                            "lastname": last,
-                            "phone": lead.phone,
-                            "email": lead.email or "",
-                        }
-                    },
-                    timeout=10,
-                )
-                log.info("hubspot contact upserted: %s", res.status_code)
-                await record_event(lead.id, "note", reason="crm.contact_upserted", meta={"provider": "hubspot"})
-                return {"ok": True, "provider": "hubspot"}
-            except Exception as e:
-                log.warning("hubspot upsert failed: %s", e)
+                await qualify_and_route(lead_id)
+                summary["requalified"] += 1
+                summary["actions"].append({"lead_id": lead_id, "kind": "requalify"})
+            except Exception as e:  # noqa: BLE001
+                clog(lead_id).exception("tick requalify failed: %s", e)
+                summary["failed"] += 1
+            continue
 
         await record_event(
-            lead.id, "note", reason="crm.contact_upserted", meta={"provider": "mock-hubspot"}
+            lead_id,
+            "error",
+            reason="call.timeout",
+            meta={
+                "waited_minutes": CALL_TIMEOUT_MINUTES,
+                "voice_call_id": doc.get("voice_call_id"),
+                "detail": "no transcript received before timeout",
+            },
         )
-        return {"ok": True, "provider": "mock-hubspot"}
+        try:
+            await transition(lead_id, "NURTURE", "call.timeout")
+            await touch(lead_id, awaiting_transcript=False)
+            summary["rescued"] += 1
+            summary["actions"].append({"lead_id": lead_id, "kind": "rescue"})
+        except HTTPException as e:
+            clog(lead_id).warning("tick rescue blocked: %s", e.detail)
+            summary["failed"] += 1
 
-    async def create_deal(self, lead: Lead) -> dict:
-        token = os.environ.get("HUBSPOT_ACCESS_TOKEN")
-        if token:
-            try:
-                res = await asyncio.to_thread(
-                    requests.post,
-                    "https://api.hubspot.com/crm/v3/objects/deals",
-                    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                    json={
-                        "properties": {
-                            "dealname": f"Deal — {lead.name}",
-                            "pipeline": "default",
-                            "dealstage": "appointmentscheduled" if lead.status == "HOT" else "qualifiedtobuy",
-                        }
-                    },
-                    timeout=10,
-                )
-                log.info("hubspot deal created: %s", res.status_code)
-                await record_event(lead.id, "note", reason="crm.deal_created", meta={"provider": "hubspot", "score": lead.score})
-                return {"ok": True, "provider": "hubspot"}
-            except Exception as e:
-                log.warning("hubspot deal failed: %s", e)
-
-        await record_event(
-            lead.id,
-            "note",
-            reason="crm.deal_created",
-            meta={"provider": "mock-hubspot", "score": lead.score},
-        )
-        return {"ok": True, "provider": "mock-hubspot"}
+    summary["took_ms"] = int((now() - started).total_seconds() * 1000)
+    log.info(
+        "tick drained=%s failed=%s rescued=%s requalified=%s",
+        summary["drained"],
+        summary["failed"],
+        summary["rescued"],
+        summary["requalified"],
+    )
+    return summary
 
 
-voice = VoiceProvider()
-booker = BookingProvider()
-notifier = NotificationProvider()
-crm = CRMProvider()
+# ---------- Qualification ----------
 
 
-# ---------- LLM Qualifier ----------
+FIELD_ORDER = ("intent", "budget", "timeline", "financing", "area")
+
+# Which qualification field a question is asking about. Checked in order, so the
+# more specific patterns win over the catch-all "looking for".
+_QUESTION_PATTERNS = [
+    ("budget", r"budget|price range|how much|spend"),
+    ("financing", r"financ|pre-?approv|mortgage|lender|loan"),
+    ("timeline", r"timeline|how soon|move in|next few months|when are you"),
+    ("area", r"neighbou?rhood|area|location|part of town|where are you look"),
+    ("intent", r"kind of property|type of property|buy, rent|looking for|rent or buy"),
+]
+
+
+def _match_question(text: str) -> Optional[str]:
+    low = text.lower()
+    for field_name, pattern in _QUESTION_PATTERNS:
+        if re.search(pattern, low):
+            return field_name
+    return None
+
+
+def extract_answers(transcript: list[dict[str, str]]) -> dict[str, Optional[str]]:
+    """Map the lead's replies onto qualification fields, deterministically.
+
+    Aligning by position alone breaks on the opening pleasantry — "Sure, go
+    ahead." lands in ``intent`` and shifts every real answer one field right,
+    which scored every keyless-demo lead ~20 and dumped it into NURTURE. So pair
+    each reply with the question that preceded it, and only fall back to
+    positional assignment when no question was recognised (a free-form live call).
+    """
+    out: dict[str, Optional[str]] = {k: None for k in FIELD_ORDER}
+    pending: Optional[str] = None
+    unmatched: list[str] = []
+
+    for turn in transcript:
+        text = (turn.get("text") or "").strip()
+        if not text:
+            continue
+        if turn.get("role") == "agent":
+            pending = _match_question(text)
+        else:
+            if pending and out[pending] is None:
+                out[pending] = text
+            else:
+                unmatched.append(text)
+            pending = None
+
+    if all(v is None for v in out.values()):
+        for field_name, text in zip(FIELD_ORDER, unmatched):
+            out[field_name] = text
+    return out
 
 
 def _fallback_score(q: Qualification) -> int:
+    """Deterministic rubric. Also the scorer of record — the LLM extracts fields,
+    this function scores them, so scoring stays explainable and reproducible."""
     score = 0
     if q.intent and any(k in q.intent.lower() for k in ("buy", "family", "invest")):
         score += 25
@@ -584,75 +856,33 @@ def _fallback_score(q: Qualification) -> int:
     return min(100, score)
 
 
-async def qualify_with_llm(lead: Lead) -> tuple[Qualification, int]:
-    """Call LLM (Groq or Gemini) to extract structured qualification + reasoning."""
+async def qualify_with_llm(lead: Lead) -> tuple[Qualification, int, ProviderResult]:
+    """Extract structured qualification from the transcript, then score it."""
     convo = "\n".join(f"{m['role'].upper()}: {m['text']}" for m in lead.transcript)
-    sys_msg = (
-        "You are an elite real-estate lead qualification analyst. "
-        "Extract structured buyer qualification data from a conversation "
-        "and return STRICT JSON only (no markdown, no prose)."
-    )
-    user_text = (
-        "Given this real-estate lead conversation, return a JSON object with "
-        "keys: intent, budget, timeline, financing, area, reasoning. "
-        "Each is a short string. `reasoning` explains the qualification in 1-2 sentences.\n\n"
-        f"Conversation:\n{convo}\n\nRespond with JSON only."
-    )
+    fallback = {
+        **extract_answers(lead.transcript),
+        "reasoning": "Fallback extraction (LLM unavailable).",
+    }
 
-    lead_answers = [m["text"] for m in lead.transcript if m["role"] == "lead"]
-    fallback_q = Qualification(
-        intent=lead_answers[0] if len(lead_answers) > 0 else None,
-        budget=lead_answers[1] if len(lead_answers) > 1 else None,
-        timeline=lead_answers[2] if len(lead_answers) > 2 else None,
-        financing=lead_answers[3] if len(lead_answers) > 3 else None,
-        area=lead_answers[4] if len(lead_answers) > 4 else None,
-        reasoning="Fallback extraction (LLM unavailable).",
+    parsed, result = await providers.llm_json(
+        "You are an elite real-estate lead qualification analyst. Extract structured "
+        "buyer qualification data from a conversation and return STRICT JSON only "
+        "(no markdown, no prose).",
+        "Given this real-estate lead conversation, return a JSON object with keys: "
+        "intent, budget, timeline, financing, area, reasoning. Each is a short string. "
+        "`reasoning` explains the qualification in 1-2 sentences.\n\n"
+        f"Conversation:\n{convo}\n\nRespond with JSON only.",
+        fallback,
+        label=f"qualify-{lead.id}",
     )
-
-    key = os.environ.get("GROQ_API_KEY") or EMERGENT_LLM_KEY
-    if key and key.startswith("gsk_"):
-        try:
-            res = await asyncio.to_thread(
-                requests.post,
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "llama-3.3-70b-versatile",
-                    "messages": [
-                        {"role": "system", "content": sys_msg},
-                        {"role": "user", "content": user_text},
-                    ],
-                    "response_format": {"type": "json_object"},
-                    "temperature": 0.2,
-                },
-                timeout=10,
-            )
-            data = res.json()
-            content = data["choices"][0]["message"]["content"]
-            parsed = json.loads(content)
-            q = Qualification(**{k: str(v) for k, v in parsed.items() if k in Qualification.model_fields})
-        except Exception as e:  # noqa: BLE001
-            log.warning("Groq qualification fallback for lead=%s: %s", lead.id, e)
-            q = fallback_q
-    else:
-        try:
-            genai.configure(api_key=key)
-            model = genai.GenerativeModel("gemini-2.0-flash", system_instruction=sys_msg)
-            resp = await model.generate_content_async(user_text)
-            text = resp.text
-            cleaned = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
-            match = re.search(r"\{[\s\S]*\}", cleaned)
-            data = json.loads(match.group(0) if match else cleaned)
-            q = Qualification(**{k: str(v) for k, v in data.items() if k in Qualification.model_fields})
-        except Exception as e:  # noqa: BLE001
-            log.warning("LLM qualification fallback for lead=%s: %s", lead.id, e)
-            q = fallback_q
-
-    score = _fallback_score(q)
-    return q, score
+    q = Qualification(
+        **{
+            k: (str(v) if v is not None else None)
+            for k, v in parsed.items()
+            if k in Qualification.model_fields
+        }
+    )
+    return q, _fallback_score(q), result
 
 
 def classify_score(score: int) -> str:
@@ -660,77 +890,223 @@ def classify_score(score: int) -> str:
         return "HOT"
     if score >= QUALIFICATION_RUBRIC["threshold_qualified"]:
         return "QUALIFIED"
-    if score < QUALIFICATION_RUBRIC["threshold_nurture"]:
-        return "NURTURE"
     return "NURTURE"
 
 
-# ---------- Background pipeline ----------
+# ---------- Pipeline ----------
+
+
+async def _move_to_calling(lead: Lead) -> bool:
+    """Try to put a lead into CALLING, honouring the state machine.
+
+    A supervisor deciding to ``call`` a QUALIFIED lead used to raise HTTP 400 into
+    a blanket ``except`` and surface as an opaque ``pipeline.error``. Now the
+    refusal is explicit and visible in the audit log.
+    """
+    if lead.status == "CALLING":
+        return True
+    if is_legal(lead.status, "CALLING"):
+        await transition(lead.id, "CALLING", "ai.dispatch")
+        return True
+    await record_event(
+        lead.id,
+        "error",
+        from_status=lead.status,
+        reason="call.blocked",
+        meta={
+            "detail": f"cannot dial from {lead.status}",
+            "legal_next": sorted(ALLOWED_TRANSITIONS.get(lead.status, set())),
+        },
+    )
+    clog(lead.id).info("call blocked from status=%s", lead.status)
+    return False
 
 
 async def run_ai_pipeline(lead_id: str) -> None:
-    """v1 automation: CALLING -> IN_CONVERSATION -> qualify -> classify -> follow-up."""
-    try:
-        await transition(lead_id, "CALLING", "ai.dispatch")
-        await asyncio.sleep(1.2)  # simulate call latency
-        lead_doc = await db.leads.find_one({"id": lead_id})
-        lead = from_mongo(Lead, lead_doc)
-        call = await voice.start_call(lead)
-        lead.transcript = call["transcript"]
-        lead.attempt_history.append(
-            {"kind": "call", "provider": call["provider"], "ts": datetime.now(timezone.utc).isoformat()}
-        )
-        await db.leads.update_one(
-            {"id": lead_id},
-            {"$set": {"transcript": lead.transcript, "attempt_history": lead.attempt_history}},
-        )
-        await record_event(lead_id, "call", meta={"turns": len(lead.transcript)})
-        await transition(lead_id, "IN_CONVERSATION", "voice.completed")
+    """Dial the lead, then qualify.
 
-        q, score = await qualify_with_llm(lead)
-        final_status = classify_score(score)
-        await db.leads.update_one(
-            {"id": lead_id},
+    Splits at the call boundary. With a mock provider the transcript is available
+    immediately and we qualify in the same pass. With a live provider the call is
+    only *dispatched* here — the lead parks in CALLING with
+    ``awaiting_transcript`` until ``POST /api/webhooks/vapi`` delivers the real
+    conversation. Qualifying an empty transcript scores every lead 0, so we never
+    do it.
+    """
+    try:
+        lead_doc = await db.leads.find_one({"id": lead_id})
+        if not lead_doc:
+            log.warning("pipeline: lead %s not found", lead_id)
+            return
+        lead = from_mongo(Lead, lead_doc)
+
+        if not await _move_to_calling(lead):
+            return
+
+        delay = float(os.environ.get("DEMO_CALL_DELAY_SECONDS", "1.2" if providers.demo_mode() else "0"))
+        if delay > 0:
+            await asyncio.sleep(delay)  # visual beat for the demo only
+
+        call = await providers.voice.start_call(
+            lead_id=lead.id, name=lead.name, phone=lead.phone, profile=lead.sim_profile
+        )
+
+        if call.live_failure:
+            # Do NOT synthesise a transcript for a real person whose call failed.
+            # Record it, park the lead in NURTURE, and retry later.
+            await record_provider(call, lead_id, reason="call.failed", kind="error")
+            await transition(lead_id, "NURTURE", "call.failed")
+            await schedule_action(
+                lead_id,
+                "supervisor",
+                now() + timedelta(hours=2),
+                reason="retry_after_call_failure",
+            )
+            return
+
+        await record_provider(call, lead_id=None)
+        attempts = list(lead.attempt_history) + [
             {
-                "$set": {
-                    "qualification": q.model_dump(),
-                    "score": score,
-                }
-            },
+                "kind": "call",
+                "provider": call.provider,
+                "mode": call.mode,
+                "ts": now_iso(),
+            }
+        ]
+        transcript = call.data.get("transcript")
+
+        if not transcript:
+            # LIVE dispatch succeeded; the transcript arrives by webhook.
+            await touch(
+                lead_id,
+                attempt_history=attempts,
+                voice_call_id=call.data.get("call_id"),
+                awaiting_transcript=True,
+            )
+            await record_event(
+                lead_id,
+                "call",
+                reason="call.awaiting_transcript",
+                meta={
+                    **call.to_meta(),
+                    "call_id": call.data.get("call_id"),
+                    "timeout_minutes": CALL_TIMEOUT_MINUTES,
+                },
+            )
+            clog(lead_id).info("live call in flight, awaiting webhook transcript")
+            return
+
+        await touch(
+            lead_id,
+            transcript=transcript,
+            attempt_history=attempts,
+            awaiting_transcript=False,
         )
         await record_event(
-            lead_id,
-            "note",
-            reason="qualification.completed",
-            meta={"score": score, "qualification": q.model_dump()},
+            lead_id, "call", reason="call.completed", meta={"turns": len(transcript), **call.to_meta()}
         )
-        await transition(lead_id, final_status, f"score={score}")
-
-        # CRM sync + follow up
-        lead_doc = await db.leads.find_one({"id": lead_id})
-        lead = from_mongo(Lead, lead_doc)
-        await crm.upsert_contact(lead)
-        if final_status in ("QUALIFIED", "HOT"):
-            await crm.create_deal(lead)
-            await notifier.send(
-                lead, "sms", "book_slot", {"suggestion": "tomorrow 2pm"}
-            )
-        else:
-            await notifier.send(lead, "email", "nurture_sequence")
+        await qualify_and_route(lead_id)
     except Exception as e:  # noqa: BLE001
-        log.exception("ai pipeline failed: %s", e)
-        await record_event(lead_id, "note", reason=f"pipeline.error: {e}")
+        clog(lead_id).exception("ai pipeline failed: %s", e)
+        await record_event(
+            lead_id, "error", reason="pipeline.error", meta={"error": str(e)[:500]}
+        )
 
 
-# ---------- Supervisor (v2: real LangGraph-style graph) ----------
+async def qualify_and_route(lead_id: str) -> dict:
+    """Score an existing transcript, route the lead, sync CRM, follow up.
+
+    The single path shared by the mock pipeline, the Vapi webhook, and /tick's
+    recovery of a half-finished lead.
+    """
+    lead_doc = await db.leads.find_one({"id": lead_id})
+    if not lead_doc:
+        raise HTTPException(404, "Lead not found")
+    lead = from_mongo(Lead, lead_doc)
+    if not lead.transcript:
+        raise HTTPException(409, "Cannot qualify a lead with no transcript")
+
+    if lead.status == "CALLING":
+        await transition(lead_id, "IN_CONVERSATION", "voice.completed")
+
+    q, score, llm = await qualify_with_llm(lead)
+    await record_provider(llm, lead_id=None)
+    if llm.live_failure:
+        await record_provider(
+            llm, lead_id, reason="qualification.llm_failed", kind="error"
+        )
+
+    await touch(lead_id, qualification=q.model_dump(), score=score, awaiting_transcript=False)
+    await record_event(
+        lead_id,
+        "note",
+        reason="qualification.completed",
+        meta={"score": score, "qualification": q.model_dump(), "llm": llm.to_meta()},
+    )
+
+    final_status = classify_score(score)
+    lead_doc = await db.leads.find_one({"id": lead_id})
+    lead = from_mongo(Lead, lead_doc)
+    if is_legal(lead.status, final_status):
+        await transition(lead_id, final_status, f"score={score}")
+    else:
+        await record_event(
+            lead_id,
+            "error",
+            from_status=lead.status,
+            reason="routing.blocked",
+            meta={"wanted": final_status, "score": score},
+        )
+
+    lead_doc = await db.leads.find_one({"id": lead_id})
+    lead = from_mongo(Lead, lead_doc)
+    await sync_crm(lead)
+
+    if lead.status in ("QUALIFIED", "HOT"):
+        await send_notification(
+            lead,
+            "sms",
+            "book_slot",
+            {
+                "body": f"Hi {lead.name}, I have viewing slots open this week — "
+                "reply with a time that works and I'll lock it in."
+            },
+        )
+    else:
+        await send_notification(
+            lead,
+            "email",
+            "nurture_sequence",
+            {
+                "subject": "A few listings worth watching",
+                "body": f"Hi {lead.name}, no rush at all — here are a few listings "
+                "in your range to keep an eye on.",
+            },
+        )
+    return {"score": score, "lead_status": lead.status, "qualification": q.model_dump()}
+
+
+# ---------- Supervisor ----------
+
+# Keep strong references so fire-and-forget tasks are not garbage-collected
+# mid-flight (asyncio only holds a weak reference to running tasks).
+_background_tasks: set[asyncio.Task] = set()
 
 
 def _dispatch_pipeline_sync(lead_id: str) -> None:
-    """Fire-and-forget pipeline dispatch used by the graph 'call' node."""
-    asyncio.create_task(run_ai_pipeline(lead_id))
+    """Fire-and-forget pipeline dispatch used by the graph's 'call' node."""
+    task = asyncio.create_task(run_ai_pipeline(lead_id))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
-# Compiled graph is built lazily so the DB + notifier are ready.
+async def _schedule_supervisor_check(lead_id: str, hours: int | None = None) -> str:
+    """Backs the supervisor's ``wait`` node with a real queued action."""
+    run_at = now() + timedelta(hours=hours if hours is not None else SUPERVISOR_WAIT_HOURS)
+    await schedule_action(lead_id, "supervisor", run_at, reason="supervisor.wait")
+    await touch(lead_id, next_check_at=run_at.isoformat())
+    return run_at.isoformat()
+
+
 _compiled_graph = None
 
 
@@ -739,12 +1115,17 @@ def get_graph():
     if _compiled_graph is None:
         from agents.supervisor import build_supervisor_graph  # local import
 
-        _compiled_graph = build_supervisor_graph(db, notifier, _dispatch_pipeline_sync)
+        _compiled_graph = build_supervisor_graph(
+            db,
+            send_notification,
+            _dispatch_pipeline_sync,
+            _schedule_supervisor_check,
+        )
     return _compiled_graph
 
 
 async def run_supervisor(lead_id: str, approve: bool | None = None) -> dict:
-    """Invoke the compiled graph. If approve is set, resume from interrupt with approval."""
+    """Invoke the compiled graph. If approve is set, resume from the interrupt."""
     lead_doc = await db.leads.find_one({"id": lead_id})
     if not lead_doc:
         raise HTTPException(404, "Lead not found")
@@ -757,15 +1138,18 @@ async def run_supervisor(lead_id: str, approve: bool | None = None) -> dict:
     else:
         state = await graph.ainvoke(initial, thread_id=lead_id)
 
-    # Persist trace + pending_approval on the lead doc for UI
     existing = lead_doc.get("supervisor_trace") or []
     merged_trace = existing + [s for s in state.get("trace", []) if s not in existing]
     await db.leads.update_one(
         {"id": lead_id},
-        {"$set": {
-            "supervisor_trace": merged_trace,
-            "pending_approval": bool(state.get("requires_approval") and state.get("_interrupt_at")),
-        }},
+        {
+            "$set": {
+                "supervisor_trace": merged_trace,
+                "pending_approval": bool(
+                    state.get("requires_approval") and state.get("_interrupt_at")
+                ),
+            }
+        },
     )
     await record_event(
         lead_id,
@@ -781,22 +1165,94 @@ async def run_supervisor(lead_id: str, approve: bool | None = None) -> dict:
     return {
         "next_action": state.get("next_action"),
         "trace": state.get("trace", []),
-        "requires_approval": bool(state.get("requires_approval") and state.get("_interrupt_at")),
+        "requires_approval": bool(
+            state.get("requires_approval") and state.get("_interrupt_at")
+        ),
         "enrichment": state.get("enrichment"),
         "followup_plan": state.get("followup_plan"),
     }
 
 
-# ---------- API ----------
+# ---------- App ----------
 
 
-app = FastAPI(title="AI Lead Qualifier")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    try:
+        await get_db().command("ping")
+        log.info("mongo connected db=%s", os.environ.get("DB_NAME", "estatex_db"))
+    except Exception as e:  # noqa: BLE001
+        log.error("mongo unreachable at startup: %s", e)
+    if providers.demo_mode():
+        log.info("DEMO_MODE=1 — every provider forced to MOCK")
+    if not os.environ.get("ADMIN_TOKEN"):
+        log.warning("ADMIN_TOKEN not set — admin routes (seed/reset/tick) are locked")
+    yield
+    close_db()
+
+
+app = FastAPI(title="EstateX AI Lead Concierge", lifespan=lifespan)
 api = APIRouter(prefix="/api")
 
 
 @api.get("/")
 async def root():
-    return {"service": "ai-lead-qualifier", "status": "ok"}
+    return {"service": "estatex-ai-lead-concierge", "status": "ok"}
+
+
+@api.get("/health")
+async def health():
+    """Boot diagnostics. Reports DB reachability instead of dying on import."""
+    db_ok, db_error = True, None
+    try:
+        await get_db().command("ping")
+    except Exception as e:  # noqa: BLE001
+        db_ok, db_error = False, str(e)[:300]
+    return {
+        "status": "ok" if db_ok else "degraded",
+        "db": "ok" if db_ok else "error",
+        "db_error": db_error,
+        "demo_mode": providers.demo_mode(),
+        "admin_configured": bool(os.environ.get("ADMIN_TOKEN")),
+        "quiet_hours": {
+            "enabled": QUIET_HOURS_ENABLED,
+            "start_utc": QUIET_HOURS_START,
+            "end_utc": QUIET_HOURS_END,
+            "active_now": in_quiet_hours(),
+        },
+        "providers": {p["name"]: p["mode"] for p in providers.all_provider_status()},
+        "ts": now_iso(),
+    }
+
+
+@api.get("/providers")
+async def list_providers():
+    """Per-provider mode plus the outcome of its last real call.
+
+    Drives the dashboard status chips: grey = MOCK, green = LIVE and healthy,
+    amber = LIVE but failing (with the real status code).
+    """
+    docs = await db.provider_health.find({}).to_list(50)
+    health = {d["_id"]: d for d in docs}
+    out = []
+    for spec in providers.all_provider_status():
+        h = health.get(spec["name"], {})
+        out.append(
+            {
+                **spec,
+                "last_ok": h.get("ok"),
+                "last_status": h.get("status"),
+                "last_error": h.get("error"),
+                "last_provider": h.get("provider"),
+                "last_call_at": h.get("at"),
+                "calls": h.get("calls", 0),
+                "failures": h.get("failures", 0),
+            }
+        )
+    return {"demo_mode": providers.demo_mode(), "providers": out}
+
+
+# ---------- Ingestion ----------
 
 
 async def _ingest_lead(
@@ -807,24 +1263,22 @@ async def _ingest_lead(
     bg: BackgroundTasks,
     extra_meta: dict | None = None,
 ) -> Lead:
-    """Shared ingestion pipeline: dedupe by phone, insert, dispatch AI."""
+    """Shared ingestion: dedupe by phone, insert, dispatch the AI pipeline."""
     existing = await db.leads.find_one({"phone": phone})
     if existing:
         return from_mongo(Lead, existing)
     lead = Lead(name=name, phone=phone, email=email, source=source)
     await db.leads.insert_one(to_mongo(lead))
     await record_event(
-        lead.id,
-        "note",
-        reason="lead.captured",
-        meta={"source": source, **(extra_meta or {})},
+        lead.id, "note", reason="lead.captured", meta={"source": source, **(extra_meta or {})}
     )
     bg.add_task(run_ai_pipeline, lead.id)
     return lead
 
 
 @api.post("/lead", response_model=Lead)
-async def create_lead(payload: LeadCreate, bg: BackgroundTasks):
+async def create_lead(payload: LeadCreate, bg: BackgroundTasks, request: Request):
+    rate_limit(request, "lead")
     return await _ingest_lead(
         name=payload.name,
         phone=payload.phone,
@@ -834,18 +1288,19 @@ async def create_lead(payload: LeadCreate, bg: BackgroundTasks):
     )
 
 
-@api.post("/leads/bulk")
+@api.post("/leads/bulk", dependencies=[Depends(require_admin)])
 async def bulk_create_leads(payload: list[LeadCreate], bg: BackgroundTasks):
     results = []
     for p in payload:
-        lead = await _ingest_lead(
-            name=p.name,
-            phone=p.phone,
-            email=p.email,
-            source=p.source or "csv_import",
-            bg=bg,
+        results.append(
+            await _ingest_lead(
+                name=p.name,
+                phone=p.phone,
+                email=p.email,
+                source=p.source or "csv_import",
+                bg=bg,
+            )
         )
-        results.append(lead)
     return {"imported": len(results), "leads": results}
 
 
@@ -853,19 +1308,14 @@ async def bulk_create_leads(payload: list[LeadCreate], bg: BackgroundTasks):
 #
 # Google POSTs a JSON body shaped like:
 # {
-#   "lead_id": "...",
-#   "api_version": "1.0",
-#   "form_id": 1234,
-#   "campaign_id": 5678,
-#   "google_key": "<pre-shared secret>",
-#   "is_test": false,
+#   "lead_id": "...", "api_version": "1.0", "form_id": 1234, "campaign_id": 5678,
+#   "google_key": "<pre-shared secret>", "is_test": false,
 #   "user_column_data": [
-#       {"column_id": "FULL_NAME",    "column_name": "Full name", "string_value": "Jane Doe"},
-#       {"column_id": "EMAIL",        "column_name": "Email",     "string_value": "jane@x.com"},
-#       {"column_id": "PHONE_NUMBER", "column_name": "Phone",     "string_value": "+14155550100"}
+#       {"column_id": "FULL_NAME",    "string_value": "Jane Doe"},
+#       {"column_id": "EMAIL",        "string_value": "jane@x.com"},
+#       {"column_id": "PHONE_NUMBER", "string_value": "+14155550100"}
 #   ]
 # }
-#
 # Docs: https://support.google.com/google-ads/answer/7206379
 
 
@@ -896,13 +1346,14 @@ def _pick(cols: list[GoogleLeadColumn], key: str) -> str | None:
 
 @api.post("/webhooks/google-leads")
 async def google_leads_webhook(payload: GoogleLeadPayload, bg: BackgroundTasks):
-    # 1. Verify the pre-shared key
-    if payload.google_key != GOOGLE_LEADS_WEBHOOK_KEY:
+    # No default key: an unconfigured webhook is closed, not guessable.
+    if not GOOGLE_LEADS_WEBHOOK_KEY:
+        log.warning("google-leads webhook rejected: GOOGLE_LEADS_WEBHOOK_KEY unset")
+        raise HTTPException(503, "Webhook not configured")
+    if not secrets.compare_digest(payload.google_key, GOOGLE_LEADS_WEBHOOK_KEY):
         log.warning("google-leads webhook rejected: bad key")
-        raise HTTPException(status_code=401, detail="Invalid google_key")
+        raise HTTPException(401, "Invalid google_key")
 
-    # 2. Extract fields (Google uses FULL_NAME / EMAIL / PHONE_NUMBER column ids;
-    #    fall back to FIRST_NAME + LAST_NAME if a FULL_NAME isn't sent).
     cols = payload.user_column_data
     name = _pick(cols, "FULL_NAME")
     if not name:
@@ -913,10 +1364,9 @@ async def google_leads_webhook(payload: GoogleLeadPayload, bg: BackgroundTasks):
     phone = _pick(cols, "PHONE_NUMBER")
 
     if not phone or not name:
-        raise HTTPException(status_code=422, detail="Missing FULL_NAME or PHONE_NUMBER")
+        raise HTTPException(422, "Missing FULL_NAME or PHONE_NUMBER")
 
     source = "google-ads-test" if payload.is_test else "google-ads"
-
     lead = await _ingest_lead(
         name=name,
         phone=phone,
@@ -930,12 +1380,162 @@ async def google_leads_webhook(payload: GoogleLeadPayload, bg: BackgroundTasks):
             "is_test": payload.is_test,
         },
     )
-    log.info(
-        "google-leads webhook accepted: lead=%s source=%s form=%s",
-        lead.id, source, payload.form_id,
-    )
+    log.info("google-leads accepted lead=%s source=%s form=%s", lead.id, source, payload.form_id)
     # Google Ads expects a 2xx within 5 seconds and does not read the body.
     return {"lead_id": lead.id, "status": "accepted"}
+
+
+# ---------- Webhook: Vapi end-of-call report ----------
+
+
+async def _claim_once(key: str, meta: dict | None = None) -> bool:
+    """Idempotency latch. False means we already processed this message."""
+    res = await db.webhook_receipts.update_one(
+        {"_id": key},
+        {"$setOnInsert": {"at": now_iso(), **(meta or {})}},
+        upsert=True,
+    )
+    return res.upserted_id is not None
+
+
+@api.post("/webhooks/vapi")
+async def vapi_webhook(request: Request):
+    """Receive the real call transcript and resume qualification.
+
+    Without this endpoint, configuring Vapi made the product worse: the live call
+    returned no transcript, qualification ran on nothing, and every lead scored 0
+    and fell to NURTURE. Vapi sends several message types; only
+    ``end-of-call-report`` carries the finished conversation.
+    """
+    secret = os.environ.get("VAPI_WEBHOOK_SECRET")
+    if secret:
+        sent = request.headers.get("x-vapi-secret") or request.headers.get("X-Vapi-Secret")
+        if not sent or not secrets.compare_digest(sent, secret):
+            raise HTTPException(401, "Invalid X-Vapi-Secret")
+
+    body = await request.json()
+    message = body.get("message") or body
+    msg_type = message.get("type")
+    if msg_type != "end-of-call-report":
+        return {"status": "ignored", "type": msg_type}
+
+    call = message.get("call") or {}
+    call_id = call.get("id") or message.get("callId")
+    lead_id = ((call.get("metadata") or {}).get("lead_id")) or (
+        (message.get("metadata") or {}).get("lead_id")
+    )
+
+    lead_doc = None
+    if lead_id:
+        lead_doc = await db.leads.find_one({"id": lead_id})
+    if not lead_doc and call_id:
+        lead_doc = await db.leads.find_one({"voice_call_id": call_id})
+    if not lead_doc:
+        log.warning("vapi webhook: no lead for call=%s lead_id=%s", call_id, lead_id)
+        raise HTTPException(404, "No lead matches this call")
+    lead_id = lead_doc["id"]
+
+    if not await _claim_once(
+        f"vapi:{call_id or lead_id}", {"lead_id": lead_id, "kind": "end-of-call-report"}
+    ):
+        return {"status": "duplicate", "lead_id": lead_id}
+
+    transcript = providers.parse_vapi_transcript(message)
+    if not transcript:
+        await record_event(
+            lead_id,
+            "error",
+            reason="call.empty_transcript",
+            meta={"call_id": call_id, "ended_reason": message.get("endedReason")},
+        )
+        await touch(lead_id, awaiting_transcript=False)
+        if is_legal(lead_doc["status"], "NURTURE"):
+            await transition(lead_id, "NURTURE", "call.empty_transcript")
+        return {"status": "empty_transcript", "lead_id": lead_id}
+
+    await touch(lead_id, transcript=transcript, awaiting_transcript=False, voice_call_id=call_id)
+    await record_event(
+        lead_id,
+        "call",
+        reason="call.transcript_received",
+        meta={
+            "turns": len(transcript),
+            "provider": "vapi",
+            "call_id": call_id,
+            "duration_seconds": message.get("durationSeconds"),
+            "ended_reason": message.get("endedReason"),
+        },
+    )
+    result = await qualify_and_route(lead_id)
+    return {"status": "qualified", "lead_id": lead_id, **result}
+
+
+# ---------- Webhook: inbound Twilio SMS ----------
+
+_STOP_WORDS = {"stop", "stopall", "unsubscribe", "cancel", "end", "quit", "revoke", "optout"}
+
+
+@api.post("/webhooks/twilio-sms")
+async def twilio_sms_webhook(request: Request):
+    """Inbound SMS. STOP opts the lead out; anything else feeds the supervisor.
+
+    Returns TwiML, which is what Twilio expects as the reply body.
+    """
+    form = await request.form()
+    from_number = (form.get("From") or "").strip()
+    text = (form.get("Body") or "").strip()
+    message_sid = form.get("MessageSid") or form.get("SmsSid")
+
+    empty_twiml = Response(
+        content='<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
+        media_type="application/xml",
+    )
+    if not from_number:
+        return empty_twiml
+
+    lead_doc = await db.leads.find_one({"phone": from_number})
+    if not lead_doc:
+        log.info("inbound sms from unknown number")
+        return empty_twiml
+    lead_id = lead_doc["id"]
+
+    if message_sid and not await _claim_once(
+        f"twilio:{message_sid}", {"lead_id": lead_id, "kind": "inbound-sms"}
+    ):
+        return empty_twiml
+
+    normalized = re.sub(r"[^a-z]", "", text.lower())
+    if normalized in _STOP_WORDS:
+        await db.leads.update_one({"id": lead_id}, {"$set": {"opted_out": True}})
+        await record_event(
+            lead_id, "note", reason="lead.opted_out", meta={"channel": "sms", "text": text}
+        )
+        return Response(
+            content=(
+                '<?xml version="1.0" encoding="UTF-8"?><Response><Message>'
+                "You're unsubscribed from EstateX Realty. No further messages will be sent."
+                "</Message></Response>"
+            ),
+            media_type="application/xml",
+        )
+
+    transcript = list(lead_doc.get("transcript") or [])
+    transcript.append({"role": "lead", "text": text})
+    await touch(lead_id, transcript=transcript)
+    await record_event(
+        lead_id, "note", reason="sms.inbound", meta={"text": text[:500], "sid": message_sid}
+    )
+    _dispatch_supervisor(lead_id)
+    return empty_twiml
+
+
+def _dispatch_supervisor(lead_id: str) -> None:
+    task = asyncio.create_task(run_supervisor(lead_id))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+# ---------- Reads ----------
 
 
 @api.get("/leads", response_model=list[Lead])
@@ -964,22 +1564,76 @@ async def get_appointments(lead_id: str):
     return [from_mongo(Appointment, d) for d in docs]
 
 
+@api.get("/leads/{lead_id}/scheduled", response_model=list[ScheduledAction])
+async def get_scheduled(lead_id: str):
+    docs = (
+        await db.scheduled_actions.find({"lead_id": lead_id}, {"_id": 0})
+        .sort("run_at", 1)
+        .to_list(50)
+    )
+    return [from_mongo(ScheduledAction, d) for d in docs]
+
+
 @api.get("/leads/{lead_id}/slots")
 async def get_slots(lead_id: str):
-    slots = await booker.get_slots(lead_id)
-    return {"slots": slots}
+    return await fetch_slots(lead_id)
+
+
+@api.get("/leads/{lead_id}/checkpoint")
+async def get_checkpoint(lead_id: str):
+    doc = await db.graph_checkpoints.find_one({"_id": lead_id})
+    if not doc:
+        return {"state": None, "current_node": None}
+    return {"state": doc.get("state"), "current_node": doc.get("current_node")}
+
+
+# ---------- Actions ----------
 
 
 @api.post("/leads/{lead_id}/book", response_model=Appointment)
 async def book(lead_id: str, req: BookSlotRequest):
+    """Reserve a viewing.
+
+    Order matters: legality is checked first, the provider is called second, and
+    only a real success flips the lead to BOOKED. Previously the transition and
+    the local Appointment happened regardless of what Cal.com returned, so a
+    failed booking still rendered as "Booked".
+    """
     doc = await db.leads.find_one({"id": lead_id})
     if not doc:
         raise HTTPException(404, "Lead not found")
-    # transition first (validates legal)
+    if not is_legal(doc["status"], "BOOKED"):
+        raise HTTPException(400, f"Illegal transition {doc['status']} -> BOOKED")
+
+    result = await providers.booker.book(
+        slot_iso=req.slot_iso, name=doc.get("name", "Lead"), email=doc.get("email")
+    )
+    if not result.ok:
+        await record_provider(result, lead_id, reason="booking.failed", kind="error")
+        raise HTTPException(
+            502,
+            f"Booking rejected by Cal.com (HTTP {result.status}): {result.error}",
+        )
+    await record_provider(result, lead_id=None)
+
+    appt = Appointment(
+        lead_id=lead_id,
+        slot_iso=req.slot_iso,
+        provider=result.provider,
+        external_id=result.data.get("booking_id"),
+    )
+    await db.appointments.insert_one(to_mongo(appt))
     await transition(lead_id, "BOOKED", "booking.confirmed")
-    appt = await booker.book(lead_id, req.slot_iso)
     await record_event(
-        lead_id, "booking", meta={"slot": req.slot_iso, "appointment_id": appt.id}
+        lead_id,
+        "booking",
+        reason="booking.created",
+        meta={
+            "slot": req.slot_iso,
+            "appointment_id": appt.id,
+            "external_id": appt.external_id,
+            **result.to_meta(),
+        },
     )
     return appt
 
@@ -991,37 +1645,97 @@ async def supervisor(lead_id: str):
 
 @api.post("/leads/{lead_id}/rerun")
 async def rerun(lead_id: str, bg: BackgroundTasks):
-    # Reset for demo comparison
-    await db.leads.update_one(
-        {"id": lead_id},
-        {"$set": {"status": "NEW", "score": 0, "qualification": None, "transcript": []}},
+    """Re-run the pipeline from a clean slate, without lying to the audit log.
+
+    NURTURE is reachable from every status and CALLING is reachable from NURTURE,
+    so routing through it keeps the reset inside the state machine instead of
+    writing ``status: NEW`` straight into Mongo.
+    """
+    doc = await db.leads.find_one({"id": lead_id})
+    if not doc:
+        raise HTTPException(404, "Lead not found")
+    await record_event(
+        lead_id, "note", from_status=doc["status"], reason="pipeline.reset"
     )
-    await record_event(lead_id, "note", reason="pipeline.reset")
+    await transition(lead_id, "NURTURE", "pipeline.reset")
+    await touch(
+        lead_id,
+        score=0,
+        qualification=None,
+        transcript=[],
+        awaiting_transcript=False,
+        voice_call_id=None,
+    )
     bg.add_task(run_ai_pipeline, lead_id)
     return {"ok": True}
 
 
+@api.post("/leads/{lead_id}/approve")
+async def approve_lead(lead_id: str):
+    result = await run_supervisor(lead_id, approve=True)
+    await db.leads.update_one({"id": lead_id}, {"$set": {"pending_approval": False}})
+    return result
+
+
+@api.post("/leads/{lead_id}/reject")
+async def reject_lead(lead_id: str):
+    result = await run_supervisor(lead_id, approve=False)
+    await db.leads.update_one({"id": lead_id}, {"$set": {"pending_approval": False}})
+    lead_doc = await db.leads.find_one({"id": lead_id})
+    if lead_doc and lead_doc["status"] == "HOT":
+        try:
+            await transition(lead_id, "NURTURE", reason="escalation.rejected")
+        except HTTPException:
+            pass
+    return result
+
+
+@api.post("/leads/{lead_id}/opt-out")
+async def opt_out(lead_id: str):
+    result = await db.leads.update_one({"id": lead_id}, {"$set": {"opted_out": True}})
+    if not result.matched_count:
+        raise HTTPException(404, "Lead not found")
+    await record_event(lead_id, "note", reason="lead.opted_out")
+    return {"ok": True}
+
+
+# ---------- Autonomy ----------
+
+
+@api.post("/tick", dependencies=[Depends(require_admin)])
+async def tick(limit: int = 25):
+    """Drive one autonomy pass. Called by cron every ~10 minutes.
+
+    The response is the demo artifact: it says exactly what the system did while
+    nobody was watching.
+    """
+    return await run_tick(limit=limit)
+
+
+# ---------- Analytics ----------
+
+FUNNEL_ORDER = ["NEW", "CALLING", "IN_CONVERSATION", "QUALIFIED", "NURTURE", "HOT", "BOOKED"]
+
+
 @api.get("/analytics")
 async def analytics():
-    total = await db.leads.count_documents({})
-    booked = await db.leads.count_documents({"status": "BOOKED"})
-    qualified = await db.leads.count_documents({"status": {"$in": ["QUALIFIED", "HOT", "BOOKED"]}})
-    hot = await db.leads.count_documents({"status": "HOT"})
-    # Funnel counts
-    statuses = ["NEW", "CALLING", "IN_CONVERSATION", "QUALIFIED", "NURTURE", "HOT", "BOOKED"]
-    funnel = []
-    for s in statuses:
-        c = await db.leads.count_documents({"status": s})
-        funnel.append({"status": s, "count": c})
+    rows = await db.leads.aggregate(
+        [{"$group": {"_id": "$status", "count": {"$sum": 1}}}]
+    ).to_list(20)
+    counts = {r["_id"]: r["count"] for r in rows if r.get("_id")}
+    total = sum(counts.values())
+    booked = counts.get("BOOKED", 0)
     return {
         "total": total,
         "booked": booked,
-        "qualified": qualified,
-        "hot": hot,
+        "qualified": counts.get("QUALIFIED", 0) + counts.get("HOT", 0) + booked,
+        "hot": counts.get("HOT", 0),
         "conversion_rate": round((booked / total) * 100, 1) if total else 0.0,
-        "funnel": funnel,
+        "funnel": [{"status": s, "count": counts.get(s, 0)} for s in FUNNEL_ORDER],
     }
 
+
+# ---------- Demo data ----------
 
 SEED_LEADS = [
     ("Emily Chen", "+14155550101", "emily.chen@example.com"),
@@ -1042,12 +1756,11 @@ SEED_LEADS = [
 ]
 
 
-@api.post("/seed")
+@api.post("/seed", dependencies=[Depends(require_admin)])
 async def seed(bg: BackgroundTasks):
     created = 0
     for name, phone, email in SEED_LEADS:
-        exists = await db.leads.find_one({"phone": phone})
-        if exists:
+        if await db.leads.find_one({"phone": phone}):
             continue
         lead = Lead(name=name, phone=phone, email=email, source="seed")
         await db.leads.insert_one(to_mongo(lead))
@@ -1057,89 +1770,64 @@ async def seed(bg: BackgroundTasks):
     return {"created": created}
 
 
-@api.delete("/reset")
+@api.delete("/reset", dependencies=[Depends(require_admin)])
 async def reset():
-    await db.leads.delete_many({})
-    await db.events.delete_many({})
-    await db.appointments.delete_many({})
-    await db.graph_checkpoints.delete_many({})
+    for coll in (
+        "leads",
+        "events",
+        "appointments",
+        "graph_checkpoints",
+        "scheduled_actions",
+        "webhook_receipts",
+        "provider_health",
+    ):
+        await db[coll].delete_many({})
     return {"ok": True}
-
-
-# ---------- Approval / opt-out / supervisor helpers ----------
-
-
-@api.post("/leads/{lead_id}/approve")
-async def approve_lead(lead_id: str):
-    result = await run_supervisor(lead_id, approve=True)
-    await db.leads.update_one({"id": lead_id}, {"$set": {"pending_approval": False}})
-    return result
-
-
-@api.post("/leads/{lead_id}/reject")
-async def reject_lead(lead_id: str):
-    result = await run_supervisor(lead_id, approve=False)
-    await db.leads.update_one({"id": lead_id}, {"$set": {"pending_approval": False}})
-    # Reverting: move a HOT lead back to NURTURE
-    lead_doc = await db.leads.find_one({"id": lead_id})
-    if lead_doc and lead_doc["status"] == "HOT":
-        try:
-            await transition(lead_id, "NURTURE", reason="escalation.rejected")
-        except HTTPException:
-            pass
-    return result
-
-
-@api.post("/leads/{lead_id}/opt-out")
-async def opt_out(lead_id: str):
-    result = await db.leads.update_one({"id": lead_id}, {"$set": {"opted_out": True}})
-    if not result.matched_count:
-        raise HTTPException(404, "Lead not found")
-    await record_event(lead_id, "note", reason="lead.opted_out")
-    return {"ok": True}
-
-
-@api.get("/leads/{lead_id}/checkpoint")
-async def get_checkpoint(lead_id: str):
-    doc = await db.graph_checkpoints.find_one({"_id": lead_id})
-    if not doc:
-        return {"state": None, "current_node": None}
-    return {"state": doc.get("state"), "current_node": doc.get("current_node")}
 
 
 # ---------- Simulation harness ----------
 
-
 SIM_LEADS = [
-    # (name, phone, email, ground_truth_class)
-    ("Sim Alpha", "+14155551001", "a1@x.com", "HOT"),
-    ("Sim Bravo", "+14155551002", "a2@x.com", "QUALIFIED"),
-    ("Sim Charlie", "+14155551003", "a3@x.com", "NURTURE"),
-    ("Sim Delta", "+14155551004", "a4@x.com", "HOT"),
-    ("Sim Echo", "+14155551005", "a5@x.com", "QUALIFIED"),
-    ("Sim Foxtrot", "+14155551006", "a6@x.com", "NURTURE"),
-    ("Sim Golf", "+14155551007", "a7@x.com", "HOT"),
-    ("Sim Hotel", "+14155551008", "a8@x.com", "QUALIFIED"),
-    ("Sim India", "+14155551009", "a9@x.com", "NURTURE"),
-    ("Sim Juliet", "+14155551010", "a10@x.com", "HOT"),
-    ("Sim Kilo", "+14155551011", "a11@x.com", "QUALIFIED"),
-    ("Sim Lima", "+14155551012", "a12@x.com", "NURTURE"),
-    ("Sim Mike", "+14155551013", "a13@x.com", "HOT"),
-    ("Sim November", "+14155551014", "a14@x.com", "QUALIFIED"),
-    ("Sim Oscar", "+14155551015", "a15@x.com", "NURTURE"),
+    ("Sim Alpha", "+14155551001", "a1@x.com"),
+    ("Sim Bravo", "+14155551002", "a2@x.com"),
+    ("Sim Charlie", "+14155551003", "a3@x.com"),
+    ("Sim Delta", "+14155551004", "a4@x.com"),
+    ("Sim Echo", "+14155551005", "a5@x.com"),
+    ("Sim Foxtrot", "+14155551006", "a6@x.com"),
+    ("Sim Golf", "+14155551007", "a7@x.com"),
+    ("Sim Hotel", "+14155551008", "a8@x.com"),
+    ("Sim India", "+14155551009", "a9@x.com"),
+    ("Sim Juliet", "+14155551010", "a10@x.com"),
+    ("Sim Kilo", "+14155551011", "a11@x.com"),
+    ("Sim Lima", "+14155551012", "a12@x.com"),
+    ("Sim Mike", "+14155551013", "a13@x.com"),
+    ("Sim November", "+14155551014", "a14@x.com"),
+    ("Sim Oscar", "+14155551015", "a15@x.com"),
 ]
 
 
-@api.post("/simulate")
+@api.post("/simulate", dependencies=[Depends(require_admin)])
 async def simulate(bg: BackgroundTasks):
-    """Run 15 scripted leads through the pipeline for eval."""
+    """Run 15 scripted leads through the pipeline for eval.
+
+    Profiles are assigned round-robin rather than at random so every scripted
+    conversation is covered and the run is reproducible.
+    """
     created = 0
-    for name, phone, email, _gt in SIM_LEADS:
+    for i, (name, phone, email) in enumerate(SIM_LEADS):
         if await db.leads.find_one({"phone": phone}):
             continue
-        lead = Lead(name=name, phone=phone, email=email, source="sim")
+        lead = Lead(
+            name=name,
+            phone=phone,
+            email=email,
+            source="sim",
+            sim_profile=i % providers.MOCK_PROFILE_COUNT,
+        )
         await db.leads.insert_one(to_mongo(lead))
-        await record_event(lead.id, "note", reason="lead.simulated")
+        await record_event(
+            lead.id, "note", reason="lead.simulated", meta={"profile": lead.sim_profile}
+        )
         bg.add_task(run_ai_pipeline, lead.id)
         created += 1
     return {"created": created, "total": len(SIM_LEADS)}
@@ -1147,43 +1835,62 @@ async def simulate(bg: BackgroundTasks):
 
 @api.get("/eval")
 async def eval_run():
-    """Return qualification accuracy, booking rate, and hallucination proxy."""
-    sim_phones = [p for _, p, _, _ in SIM_LEADS]
-    gt = {p: cls for _, p, _, cls in SIM_LEADS}
-    docs = await db.leads.find({"phone": {"$in": sim_phones}}, {"_id": 0}).to_list(50)
-    correct = 0
-    total_graded = 0
-    hallucination_hits = 0
+    """Score the pipeline against the deterministic rubric on the same transcript.
+
+    Ground truth is derived, not declared: for each simulated lead we re-extract
+    the answers from its own transcript with :func:`extract_answers` and run the
+    rubric. The graded number is therefore *agreement between the LLM-driven
+    qualification and the rule-based baseline on identical input* — which is a
+    real measurement of extraction fidelity.
+
+    With no ``GROQ_API_KEY`` both sides are the same code path, so agreement is
+    trivially 1.0. ``baseline_only`` says so rather than passing the figure off
+    as model accuracy.
+    """
+    docs = await db.leads.find({"source": "sim"}, {"_id": 0}).to_list(100)
+    agree = 0
+    graded = 0
+    hallucinated = 0
+    disagreements = []
+
     for d in docs:
-        actual = d["status"]
-        expected = gt[d["phone"]]
-        # Grade only if pipeline finished at a terminal class (not CALLING/IN_CONV)
-        if actual in ("QUALIFIED", "HOT", "NURTURE", "BOOKED"):
-            total_graded += 1
-            terminal = "HOT" if expected == "HOT" and actual in ("HOT", "BOOKED") else expected
-            if actual == terminal or (expected == "HOT" and actual == "BOOKED"):
-                correct += 1
-        # Cheap hallucination proxy: any qualification field containing tokens
-        # not present in the transcript
-        transcript_text = " ".join(t.get("text", "") for t in d.get("transcript", [])).lower()
+        transcript = d.get("transcript") or []
+        if not transcript or d["status"] not in ("QUALIFIED", "HOT", "NURTURE", "BOOKED"):
+            continue
+        graded += 1
+        baseline_q = Qualification(**extract_answers(transcript))
+        expected = classify_score(_fallback_score(baseline_q))
+        actual = "HOT" if d["status"] == "BOOKED" and expected == "HOT" else d["status"]
+        if actual == expected:
+            agree += 1
+        else:
+            disagreements.append(
+                {"lead_id": d["id"], "expected": expected, "actual": d["status"], "score": d.get("score")}
+            )
+
+        # Cheap grounding check: a qualification value that appears nowhere in
+        # the transcript was invented rather than extracted.
+        text = " ".join(t.get("text", "") for t in transcript).lower()
         q = d.get("qualification") or {}
-        for field in ("budget", "area", "timeline"):
-            v = (q.get(field) or "").lower()
-            if v and v not in transcript_text and len(v) > 3:
-                # Very rough: assume the LLM invented it
-                hallucination_hits += 1
+        for field_name in ("budget", "area", "timeline"):
+            v = (q.get(field_name) or "").lower()
+            if v and len(v) > 3 and v not in text:
+                hallucinated += 1
                 break
-    accuracy = round(correct / total_graded, 3) if total_graded else 0.0
-    booking_rate = round(
-        sum(1 for d in docs if d["status"] == "BOOKED") / max(1, len(docs)), 3
-    )
+
     return {
-        "graded": total_graded,
-        "correct": correct,
-        "qualification_accuracy": accuracy,
-        "booking_rate": booking_rate,
-        "hallucination_rate": round(hallucination_hits / max(1, len(docs)), 3),
+        "graded": graded,
+        "agreements": agree,
+        "rubric_agreement": round(agree / graded, 3) if graded else 0.0,
+        "hallucination_rate": round(hallucinated / graded, 3) if graded else 0.0,
+        "booking_rate": round(
+            sum(1 for d in docs if d["status"] == "BOOKED") / len(docs), 3
+        )
+        if docs
+        else 0.0,
         "sample_size": len(docs),
+        "baseline_only": providers.provider_status("groq")["mode"] == "MOCK",
+        "disagreements": disagreements[:10],
     }
 
 
@@ -1195,8 +1902,3 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.on_event("shutdown")
-async def _shutdown():
-    client.close()
