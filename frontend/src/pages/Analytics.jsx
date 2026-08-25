@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { api } from "../lib/api";
+import { usePoll } from "../lib/usePoll";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from "recharts";
 
 const COLORS = {
@@ -15,11 +16,12 @@ const COLORS = {
 export default function Analytics() {
     const [data, setData] = useState(null);
 
-    useEffect(() => {
-        api.get("/analytics").then((r) => setData(r.data));
-        const t = setInterval(() => api.get("/analytics").then((r) => setData(r.data)), 4000);
-        return () => clearInterval(t);
-    }, []);
+    usePoll(() => {
+        api
+            .get("/analytics")
+            .then((r) => setData(r.data))
+            .catch(() => {});
+    }, 15000);
 
     if (!data) return <div className="p-8 text-slate-500">Loading…</div>;
 
