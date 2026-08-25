@@ -1,0 +1,107 @@
+# Render Blueprint — the always-on half of EstateX.
+#
+# Why not serverless: the pipeline runs work after the response is returned
+# (background call + qualification) and the autonomy tick needs a process that
+# is alive between requests. A frozen serverless container strands leads in
+# CALLING. Any always-on host works — Railway and Fly.io are drop-in, since
+# nothing here is Render-specific beyond this file.
+#
+# Deploy: Render Dashboard -> New -> Blueprint -> pick this repo. It reads this
+# file, creates the service, and prompts for the secrets marked `sync: false`.
+#
+# Free instances spin down after ~15 minutes idle (~50s cold start). The
+# .github/workflows/tick.yml cron hits /api/tick every 10 minutes, which keeps
+# the instance warm *and* drives the scheduler — one mechanism, two jobs.
+
+services:
+  - type: web
+    name: estatex-api
+    runtime: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.11"
+
+      # ---- required: paste in the dashboard (never committed) ----
+      # MongoDB Atlas M0 is free. The driver pins certifi's CA bundle, so
+      # mongodb+srv:// works on Render without extra TLS setup.
+      - key: MONGO_URL
+        sync: false
+      - key: DB_NAME
+        value: estatex_db
+
+      # Guards seed / simulate / bulk / tick / reset. Render generates a strong
+      # value; copy it into the GitHub ADMIN_TOKEN secret so the cron can tick,
+      # and into the dashboard's Admin prompt to unlock write actions in the UI.
+      - key: ADMIN_TOKEN
+        generateValue: true
+
+      # Your Vercel origin, e.g. https://estatex.vercel.app
+      - key: CORS_ORIGINS
+        sync: false
+
+      # ---- demo posture ----
+      # 1 = every provider mocked, deterministic, nothing external contacted.
+      # Set to 0 once you have added real keys below.
+      - key: DEMO_MODE
+        value: "1"
+      - key: DEMO_CALL_DELAY_SECONDS
+        value: "1.2"
+
+      # ---- autonomy + compliance ----
+      - key: QUIET_HOURS_ENABLED
+        value: "1"
+      - key: QUIET_HOURS_START
+        value: "21"
+      - key: QUIET_HOURS_END
+        value: "8"
+      - key: CALL_TIMEOUT_MINUTES
+        value: "20"
+      - key: SUPERVISOR_WAIT_HOURS
+        value: "6"
+      - key: LEAD_RATE_LIMIT_PER_MIN
+        value: "10"
+
+      # ---- optional integrations: add a value and that provider goes LIVE ----
+      # See backend/.env.example for what each one unlocks.
+      - key: GROQ_API_KEY
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: FROM_EMAIL
+        value: onboarding@resend.dev
+      - key: DEMO_EMAIL
+        sync: false
+      - key: CAL_API_KEY
+        sync: false
+      - key: CAL_EVENT_TYPE_ID
+        sync: false
+      - key: HUBSPOT_ACCESS_TOKEN
+        sync: false
+      - key: GOOGLE_LEADS_WEBHOOK_KEY
+        sync: false
+
+      # Keys alone are not enough for these two: SMS needs A2P 10DLC approval
+      # and voice bills per minute, so each has an explicit on switch.
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_PHONE_NUMBER
+        sync: false
+      - key: SMS_ENABLED
+        value: ""
+      - key: VAPI_API_KEY
+        sync: false
+      - key: VAPI_PHONE_NUMBER_ID
+        sync: false
+      - key: VAPI_ASSISTANT_ID
+        sync: false
+      - key: VAPI_WEBHOOK_SECRET
+        generateValue: true
+      - key: VOICE_ENABLED
+        value: ""
