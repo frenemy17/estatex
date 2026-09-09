@@ -185,3 +185,70 @@ def test_llm_json_without_a_key_returns_the_fallback(monkeypatch):
     data, res = run(providers.llm_json("sys", "prompt", fallback, label="t"))
     assert data == fallback
     assert res.mode == "MOCK" and res.live_failure is False
+
+
+def test_twilio_voice_call_dispatched_when_live(monkeypatch):
+    class FakeResponse:
+        status_code = 201
+
+        def json(self):
+            return {"sid": "CA_test_call_sid_123"}
+
+    monkeypatch.delenv("DEMO_MODE", raising=False)
+    monkeypatch.setenv("TWILIO_ACCOUNT_SID", "AC_voice_test")
+    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "voice_token")
+    monkeypatch.setenv("TWILIO_PHONE_NUMBER", "+15551112222")
+    monkeypatch.setenv("VOICE_ENABLED", "1")
+    monkeypatch.delenv("VAPI_API_KEY", raising=False)
+
+    import requests
+
+    called_url = []
+
+    def fake_post(url, *args, **kwargs):
+        called_url.append(url)
+        return FakeResponse()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    res = run(providers.voice.start_call(lead_id="lead_tw1", name="Sarah Connor", phone="+14155559999"))
+    assert res.mode == "LIVE" and res.ok is True
+    assert res.data["call_id"] == "CA_test_call_sid_123"
+    assert res.data["transcript"] is None
+    assert "Accounts/AC_voice_test/Calls.json" in called_url[0]
+
+
+def test_twilio_voice_call_live_failure_reported(monkeypatch):
+    class FakeBadResponse:
+        status_code = 401
+        text = '{"code": 20003, "message": "Authenticate"}'
+
+        def json(self):
+            return {"code": 20003, "message": "Authenticate"}
+
+    monkeypatch.delenv("DEMO_MODE", raising=False)
+    monkeypatch.setenv("TWILIO_ACCOUNT_SID", "AC_bad_sid")
+    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "bad_token")
+    monkeypatch.setenv("TWILIO_PHONE_NUMBER", "+15551112222")
+    monkeypatch.setenv("VOICE_ENABLED", "1")
+    monkeypatch.delenv("VAPI_API_KEY", raising=False)
+
+    import requests
+    monkeypatch.setattr(requests, "post", lambda *a, **kw: FakeBadResponse())
+
+    res = run(providers.voice.start_call(lead_id="lead_fail", name="John", phone="+14155550000"))
+    assert res.mode == "LIVE" and res.ok is False
+    assert res.live_failure is True
+    assert res.status == 401
+
+
+def test_conversational_agent_turn_step_progression():
+    # Turn 1
+    t1 = run(providers.conversational_agent_turn("Alex", [], step=1))
+    assert "Alex" in t1["reply"] or "property" in t1["reply"]
+    assert t1["done"] is False
+
+    # Final step
+    t4 = run(providers.conversational_agent_turn("Alex", [], step=4))
+    assert t4["done"] is True
+

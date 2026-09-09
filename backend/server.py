@@ -30,6 +30,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal, Optional
+from xml.sax.saxutils import escape
 
 import certifi
 from dotenv import load_dotenv
@@ -1468,6 +1469,202 @@ async def vapi_webhook(request: Request):
     )
     result = await qualify_and_route(lead_id)
     return {"status": "qualified", "lead_id": lead_id, **result}
+
+
+# ---------- Twilio Voice: Interactive Speech Agent ----------
+
+
+async def _finalize_twilio_voice_call(
+    lead_id: str, transcript: list[dict[str, str]], call_sid: Optional[str] = None
+):
+    """Save finalized voice call transcript, record audit event, and trigger qualification."""
+    await touch(
+        lead_id,
+        transcript=transcript,
+        awaiting_transcript=False,
+        voice_call_id=call_sid,
+    )
+    await record_event(
+        lead_id,
+        "call",
+        reason="call.transcript_received",
+        meta={
+            "turns": len(transcript),
+            "provider": "twilio-voice",
+            "call_id": call_sid,
+            "ended_reason": "completed",
+        },
+    )
+    try:
+        await qualify_and_route(lead_id)
+    except Exception as e:  # noqa: BLE001
+        log.exception("qualify_and_route failed for %s: %s", lead_id, e)
+
+
+@api.api_route("/voice/twiml", methods=["GET", "POST"])
+async def voice_twiml_endpoint(request: Request, lead_id: Optional[str] = None):
+    """Twilio Voice webhook for outbound call initialisation.
+
+    Returns TwiML instructing Twilio to greet the lead with Amazon Polly neural TTS
+    and begin interactive speech recognition with <Gather>.
+    """
+    if not lead_id:
+        params = dict(request.query_params)
+        lead_id = params.get("lead_id")
+    if not lead_id:
+        try:
+            form = await request.form()
+            lead_id = form.get("lead_id")
+        except Exception:  # noqa: BLE001
+            pass
+
+    lead_name = "there"
+    if lead_id:
+        lead_doc = await db.leads.find_one({"id": lead_id})
+        if lead_doc:
+            lead_name = lead_doc.get("name", "there")
+
+    greeting = (
+        f"Hi {lead_name}, this is Sarah from EstateX Realty. Thanks for your inquiry! "
+        "Do you have a quick moment to discuss what you are looking for in a home?"
+    )
+    gather_url = f"/api/voice/gather?lead_id={lead_id or ''}&step=1"
+
+    twiml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        "<Response>\n"
+        f'    <Say voice="Polly.Joanna">{escape(greeting)}</Say>\n'
+        f'    <Gather input="speech" action="{escape(gather_url)}" method="POST" speechTimeout="auto" timeout="6">\n'
+        '        <Say voice="Polly.Joanna">Please tell me what kind of property you have in mind.</Say>\n'
+        "    </Gather>\n"
+        '    <Say voice="Polly.Joanna">We did not hear anything. We will follow up by text or email. Goodbye!</Say>\n'
+        "    <Hangup/>\n"
+        "</Response>"
+    )
+    return Response(content=twiml, media_type="application/xml")
+
+
+@api.post("/voice/gather")
+async def voice_gather_endpoint(
+    request: Request, lead_id: Optional[str] = None, step: int = 1
+):
+    """Twilio Voice webhook called after speech is captured.
+
+    Streams speech into Groq LLM, generates the next conversational question,
+    and upon conclusion schedules qualify_and_route(lead_id).
+    """
+    form_data: dict[str, Any] = {}
+    try:
+        form = await request.form()
+        form_data = dict(form)
+    except Exception:  # noqa: BLE001
+        pass
+
+    if not lead_id:
+        lead_id = form_data.get("lead_id") or request.query_params.get("lead_id")
+
+    speech_result = (form_data.get("SpeechResult") or "").strip()
+    call_sid = form_data.get("CallSid")
+
+    if not lead_id:
+        twiml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            "<Response>\n"
+            '    <Say voice="Polly.Joanna">Thank you. Goodbye!</Say>\n'
+            "    <Hangup/>\n"
+            "</Response>"
+        )
+        return Response(content=twiml, media_type="application/xml")
+
+    lead_doc = await db.leads.find_one({"id": lead_id})
+    if not lead_doc:
+        twiml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            "<Response>\n"
+            '    <Say voice="Polly.Joanna">Thank you. Goodbye!</Say>\n'
+            "    <Hangup/>\n"
+            "</Response>"
+        )
+        return Response(content=twiml, media_type="application/xml")
+
+    lead_name = lead_doc.get("name", "there")
+    history = list(lead_doc.get("transcript") or [])
+
+    # If transcript is empty, seed with initial agent greeting
+    if not history:
+        history.append({
+            "role": "agent",
+            "text": (
+                f"Hi {lead_name}, this is Sarah from EstateX Realty. Thanks for your inquiry! "
+                "Do you have a quick moment to discuss what you are looking for in a home?"
+            ),
+        })
+
+    # If speech was detected, append caller turn
+    if speech_result:
+        history.append({"role": "lead", "text": speech_result})
+    else:
+        # Caller was silent
+        if step >= 3:
+            await _finalize_twilio_voice_call(lead_id, history, call_sid)
+            twiml = (
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                "<Response>\n"
+                '    <Say voice="Polly.Joanna">Thank you for your time. Have a wonderful day!</Say>\n'
+                "    <Hangup/>\n"
+                "</Response>"
+            )
+            return Response(content=twiml, media_type="application/xml")
+
+        twiml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            "<Response>\n"
+            '    <Say voice="Polly.Joanna">I am sorry, I did not catch that. Could you repeat?</Say>\n'
+            f'    <Gather input="speech" action="/api/voice/gather?lead_id={lead_id}&amp;step={step}" method="POST" speechTimeout="auto" timeout="6"/>\n'
+            '    <Say voice="Polly.Joanna">Thank you. Goodbye!</Say>\n'
+            "    <Hangup/>\n"
+            "</Response>"
+        )
+        return Response(content=twiml, media_type="application/xml")
+
+    # Generate next turn via Groq LLM / providers
+    agent_turn = await providers.conversational_agent_turn(lead_name, history, step=step)
+    reply_text = agent_turn.get("reply", "Thank you for sharing that.")
+    is_done = agent_turn.get("done", False) or step >= 4
+
+    history.append({"role": "agent", "text": reply_text})
+
+    if is_done:
+        conclude_text = (
+            f"{reply_text} Thank you! I have recorded your preferences and our senior advisor will follow up shortly. Have a wonderful day!"
+        )
+        history.append({
+            "role": "agent",
+            "text": "Thank you! I have recorded your preferences and our senior advisor will follow up shortly. Have a wonderful day!",
+        })
+        await _finalize_twilio_voice_call(lead_id, history, call_sid)
+        twiml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            "<Response>\n"
+            f'    <Say voice="Polly.Joanna">{escape(conclude_text)}</Say>\n'
+            "    <Hangup/>\n"
+            "</Response>"
+        )
+        return Response(content=twiml, media_type="application/xml")
+
+    await touch(lead_id, transcript=history)
+    next_step = step + 1
+    next_gather_url = f"/api/voice/gather?lead_id={lead_id}&step={next_step}"
+    twiml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        "<Response>\n"
+        f'    <Say voice="Polly.Joanna">{escape(reply_text)}</Say>\n'
+        f'    <Gather input="speech" action="{escape(next_gather_url)}" method="POST" speechTimeout="auto" timeout="6"/>\n'
+        '    <Say voice="Polly.Joanna">Thank you, we will follow up shortly. Goodbye!</Say>\n'
+        "    <Hangup/>\n"
+        "</Response>"
+    )
+    return Response(content=twiml, media_type="application/xml")
 
 
 # ---------- Webhook: inbound Twilio SMS ----------

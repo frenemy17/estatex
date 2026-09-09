@@ -55,7 +55,7 @@ def lead_doc(fake_db, lead_id: str) -> dict:
     return run(fake_db.leads.find_one({"id": lead_id}))
 
 
-def fake_request(host: str = "10.0.0.1", headers: dict | None = None, body=None, form=None):
+def fake_request(host: str = "10.0.0.1", headers: dict | None = None, body=None, form=None, query_params: dict | None = None):
     async def _json():
         return body
 
@@ -65,6 +65,7 @@ def fake_request(host: str = "10.0.0.1", headers: dict | None = None, body=None,
     return SimpleNamespace(
         client=SimpleNamespace(host=host),
         headers=headers or {},
+        query_params=query_params or {},
         json=_json,
         form=_form,
     )
@@ -655,3 +656,39 @@ def test_eval_grades_against_the_rubric_and_flags_baseline_mode(fake_db):
     # Honest labelling: with no LLM key both sides are the same code path.
     assert report["baseline_only"] is True
     assert report["disagreements"] == []
+
+
+def test_twilio_voice_twiml_endpoint_returns_greeting_and_gather(fake_db):
+    lead_id = make_lead(fake_db, name="Diana Prince")
+    req = fake_request(query_params={"lead_id": lead_id})
+    resp = run(server.voice_twiml_endpoint(req, lead_id=lead_id))
+    assert resp.media_type == "application/xml"
+    assert b"Diana Prince" in resp.body
+    assert b"<Gather input=\"speech\"" in resp.body
+    assert b"Polly.Joanna" in resp.body
+
+
+def test_twilio_voice_gather_accumulates_speech_and_finalizes(fake_db):
+    lead_id = make_lead(fake_db, name="Bruce Wayne", status="CALLING")
+
+    # Turn 1: Lead responds with intent
+    req1 = fake_request(form={"SpeechResult": "Looking to buy a luxury property", "CallSid": "CA_tw_01"})
+    resp1 = run(server.voice_gather_endpoint(req1, lead_id=lead_id, step=1))
+    assert resp1.media_type == "application/xml"
+    assert b"<Gather input=\"speech\"" in resp1.body
+    doc1 = lead_doc(fake_db, lead_id)
+    assert any("Looking to buy" in t.get("text", "") for t in doc1.get("transcript", []))
+
+    # Turn 4 (Final turn): Lead provides final detail, call concludes and qualifies
+    req4 = fake_request(form={"SpeechResult": "Budget 10 million preapproved in Gotham", "CallSid": "CA_tw_01"})
+    resp4 = run(server.voice_gather_endpoint(req4, lead_id=lead_id, step=4))
+    assert resp4.media_type == "application/xml"
+    assert b"<Hangup/>" in resp4.body
+    assert b"recorded your preferences" in resp4.body
+
+    # Lead should now be qualified out of CALLING
+    doc_final = lead_doc(fake_db, lead_id)
+    assert doc_final["status"] in ("QUALIFIED", "HOT", "NURTURE")
+    assert doc_final["awaiting_transcript"] is False
+    assert "call.transcript_received" in reasons(fake_db, lead_id)
+
