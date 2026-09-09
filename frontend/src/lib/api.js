@@ -80,8 +80,8 @@ export function scoreBand(score) {
 
 export const PROVIDER_TONES = {
     LIVE_OK: { color: "#34d399", label: "Live", dot: "bg-emerald-400" },
-    LIVE_ERROR: { color: "#fbbf24", label: "Degraded", dot: "bg-amber-400 animate-pulse-dot" },
-    MOCK: { color: "#64748b", label: "Mock", dot: "bg-slate-500" },
+    LIVE_ERROR: { color: "#ef4444", label: "Failed", dot: "bg-red-500 animate-pulse-dot" },
+    MOCK: { color: "#eab308", label: "Mock", dot: "bg-yellow-500" },
 };
 
 export function providerTone(p) {
