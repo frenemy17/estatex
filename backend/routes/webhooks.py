@@ -47,13 +47,10 @@ def _pick(cols: list[GoogleLeadColumn], key: str) -> str | None:
 @router.post("/webhooks/google-leads")
 async def google_leads_webhook(payload: GoogleLeadPayload, bg: BackgroundTasks):
     srv = sys.modules.get("server")
-    webhook_key = (
-        getattr(srv, "GOOGLE_LEADS_WEBHOOK_KEY", None)
-        if srv and hasattr(srv, "GOOGLE_LEADS_WEBHOOK_KEY")
-        else GOOGLE_LEADS_WEBHOOK_KEY
-    )
-    if webhook_key is None:
-        webhook_key = os.environ.get("GOOGLE_LEADS_WEBHOOK_KEY")
+    if srv and hasattr(srv, "GOOGLE_LEADS_WEBHOOK_KEY"):
+        webhook_key = srv.GOOGLE_LEADS_WEBHOOK_KEY
+    else:
+        webhook_key = GOOGLE_LEADS_WEBHOOK_KEY or os.environ.get("GOOGLE_LEADS_WEBHOOK_KEY")
 
     if not webhook_key:
         log.warning("google-leads webhook rejected: GOOGLE_LEADS_WEBHOOK_KEY unset")
