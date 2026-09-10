@@ -7,7 +7,7 @@ EstateX has a complete, working, offline-tested baseline (v1 automation pipeline
 ## Phases
 
 - [x] **Phase 1: Real Provider Live Readiness** — Verify and configure live credentials for Groq, Cal.com, Resend, Twilio, and HubSpot so every status chip is green and real API calls execute. (completed 2026-09-09)
-- [ ] **Phase 2: Autonomous Queue Resilience** — Implement exponential backoff retries for failed scheduled actions and replace in-memory rate limiting with a persistent store.
+- [x] **Phase 2: Autonomous Queue Resilience** — Implement exponential backoff retries for failed scheduled actions and replace in-memory rate limiting with a persistent store. (completed 2026-09-10)
 - [ ] **Phase 3: Monolithic Server Refactoring** — Modularize `backend/server.py` into dedicated FastAPI routers and domain services while preserving 100% offline test passes.
 - [ ] **Phase 4: Frontend Testing Suite** — Author automated unit and component tests for React components, Kanban board, and client API layers.
 
@@ -52,8 +52,8 @@ Plans:
 
 Plans:
 
-- [ ] 02-01: Implement exponential backoff retry scheduling and dead-letter queue semantics in `/api/tick`.
-- [ ] 02-02: Implement persistent MongoDB-backed rate limiter with TTL indexes.
+- [x] 02-01: Implement exponential backoff retry scheduling and dead-letter queue semantics in `/api/tick`.
+- [x] 02-02: Implement persistent MongoDB-backed rate limiter with TTL indexes.
 
 ---
 

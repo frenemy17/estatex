@@ -50,8 +50,8 @@ Requirements for the current development cycle:
 
 ### Autonomous Queue Resilience
 
-- [ ] **RESIL-01**: `scheduled_actions` runner implements exponential backoff retry loop for `FAILED` actions (`attempts < 5`).
-- [ ] **RESIL-02**: Distributed rate limiting mechanism implemented to replace single-process in-memory limiter.
+- [x] **RESIL-01**: `scheduled_actions` runner implements exponential backoff retry loop for `FAILED` actions (`attempts < 5`).
+- [x] **RESIL-02**: Distributed rate limiting mechanism implemented to replace single-process in-memory limiter.
 
 ### Architecture Refactoring
 
@@ -71,8 +71,8 @@ Requirements for the current development cycle:
 | PROV-03 | Phase 1: Real Provider Live Readiness | Complete |
 | PROV-04 | Phase 1: Real Provider Live Readiness | Complete |
 | PROV-05 | Phase 1: Real Provider Live Readiness | Complete |
-| RESIL-01 | Phase 2: Autonomous Queue Resilience | Pending |
-| RESIL-02 | Phase 2: Autonomous Queue Resilience | Pending |
+| RESIL-01 | Phase 2: Autonomous Queue Resilience | Complete |
+| RESIL-02 | Phase 2: Autonomous Queue Resilience | Complete |
 | MOD-01 | Phase 3: Monolithic Server Refactoring | Pending |
 | MOD-02 | Phase 3: Monolithic Server Refactoring | Pending |
 | UI-01 | Phase 4: Frontend Testing Suite | Pending |
