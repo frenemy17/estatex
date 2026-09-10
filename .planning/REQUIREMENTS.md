@@ -60,7 +60,7 @@ Requirements for the current development cycle:
 
 ### Frontend Testing & Quality
 
-- [ ] **UI-01**: Establish React Testing Library component tests covering `Dashboard.jsx` (Kanban), `LeadDetail.jsx`, and `ProviderStatus.jsx`.
+- [x] **UI-01**: Establish React Testing Library component tests covering `Dashboard.jsx` (Kanban), `LeadDetail.jsx`, and `ProviderStatus.jsx`.
 
 ## Traceability Matrix
 
@@ -75,7 +75,7 @@ Requirements for the current development cycle:
 | RESIL-02 | Phase 2: Autonomous Queue Resilience | Complete |
 | MOD-01 | Phase 3: Monolithic Server Refactoring | Complete |
 | MOD-02 | Phase 3: Monolithic Server Refactoring | Complete |
-| UI-01 | Phase 4: Frontend Testing Suite | Pending |
+| UI-01 | Phase 4: Frontend Testing Suite | Complete |
 
 ---
 *Requirements defined: 2026-09-09*

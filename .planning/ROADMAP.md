@@ -9,7 +9,7 @@ EstateX has a complete, working, offline-tested baseline (v1 automation pipeline
 - [x] **Phase 1: Real Provider Live Readiness** — Verify and configure live credentials for Groq, Cal.com, Resend, Twilio, and HubSpot so every status chip is green and real API calls execute. (completed 2026-09-09)
 - [x] **Phase 2: Autonomous Queue Resilience** — Implement exponential backoff retries for failed scheduled actions and replace in-memory rate limiting with a persistent store. (completed 2026-09-10)
 - [x] **Phase 3: Monolithic Server Refactoring** — Modularize `backend/server.py` into dedicated FastAPI routers and domain services while preserving 100% offline test passes. (completed 2026-09-10)
-- [ ] **Phase 4: Frontend Testing Suite** — Author automated unit and component tests for React components, Kanban board, and client API layers.
+- [x] **Phase 4: Frontend Testing Suite** — Author automated unit and component tests for React components, Kanban board, and client API layers. (completed 2026-09-10)
 
 ---
 
@@ -94,8 +94,8 @@ Plans:
 
 Plans:
 
-- [ ] 04-01: Setup React Testing Library test harness and mock handlers for API endpoints.
-- [ ] 04-02: Implement component test suites for `Dashboard`, `LeadDetail`, and `ProviderStatus`.
+- [x] 04-01: Setup React Testing Library test harness and mock handlers for API endpoints.
+- [x] 04-02: Implement component test suites for `Dashboard`, `LeadDetail`, and `ProviderStatus`.
 
 ---
 *Roadmap defined: 2026-09-09*
