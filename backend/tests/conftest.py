@@ -96,6 +96,14 @@ class _Cursor:
         self._docs.sort(key=lambda d: (d.get(key) is None, d.get(key)), reverse=direction < 0)
         return self
 
+    def skip(self, count: int):
+        self._docs = self._docs[count:]
+        return self
+
+    def limit(self, count: int):
+        self._docs = self._docs[:count]
+        return self
+
     async def to_list(self, length: int | None = None):
         return self._docs if length is None else self._docs[:length]
 

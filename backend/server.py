@@ -259,9 +259,14 @@ class ScheduledAction(BaseDoc):
     kind: str  # supervisor | notify
     run_at: str  # ISO-8601 UTC; compared lexicographically
     payload: dict[str, Any] = Field(default_factory=dict)
-    state: str = "PENDING"  # PENDING | RUNNING | DONE | FAILED
+    state: str = "PENDING"  # PENDING | RUNNING | DONE | FAILED | DEAD_LETTER
     attempts: int = 0
+    max_attempts: int = 5
     error: Optional[str] = None
+    last_error: Optional[str] = None
+    dead_letter_reason: Optional[str] = None
+    failed_at: Optional[str] = None
+    requeued_at: Optional[str] = None
     reason: str = ""
     created_at: datetime = Field(default_factory=now)
 
@@ -660,12 +665,22 @@ async def _run_scheduled(doc: dict) -> str:
     raise ValueError(f"unknown scheduled action kind: {kind}")
 
 
+MAX_SCHEDULED_ATTEMPTS = int(os.environ.get("MAX_SCHEDULED_ATTEMPTS", "5"))
+BACKOFF_BASE_SECONDS = int(os.environ.get("BACKOFF_BASE_SECONDS", "30"))
+MAX_BACKOFF_SECONDS = int(os.environ.get("MAX_BACKOFF_SECONDS", "3600"))
+
+
+def compute_backoff_seconds(attempt: int) -> int:
+    """Calculate exponential backoff delay: base * 2^(attempt - 1), capped at max."""
+    return min(BACKOFF_BASE_SECONDS * (2 ** max(0, attempt - 1)), MAX_BACKOFF_SECONDS)
+
+
 async def run_tick(limit: int = 25) -> dict:
     """One idempotent autonomy pass. This is the whole scheduler.
 
-    1. drain due ``scheduled_actions``
-    2. rescue leads stranded mid-call (a serverless freeze or a dropped Vapi
-       webhook would otherwise leave them in CALLING forever)
+    1. drain due ``scheduled_actions`` with exponential retries and dead-letter queue
+    2. rescue leads stranded mid-call (a serverless freeze or a dropped webhook
+       would otherwise leave them in CALLING forever)
 
     Safe to run concurrently: each action is claimed with a conditional update,
     so two overlapping ticks cannot run the same row twice.
@@ -675,6 +690,8 @@ async def run_tick(limit: int = 25) -> dict:
         "ran_at": started.isoformat(),
         "drained": 0,
         "failed": 0,
+        "retried": 0,
+        "dead_lettered": 0,
         "rescued": 0,
         "requalified": 0,
         "actions": [],
@@ -682,7 +699,10 @@ async def run_tick(limit: int = 25) -> dict:
 
     due = (
         await db.scheduled_actions.find(
-            {"state": "PENDING", "run_at": {"$lte": started.isoformat()}}
+            {
+                "state": {"$in": ["PENDING", "FAILED"]},
+                "run_at": {"$lte": started.isoformat()},
+            }
         )
         .sort("run_at", 1)
         .to_list(limit)
@@ -690,7 +710,7 @@ async def run_tick(limit: int = 25) -> dict:
 
     for doc in due:
         claim = await db.scheduled_actions.update_one(
-            {"id": doc["id"], "state": "PENDING"},
+            {"id": doc["id"], "state": {"$in": ["PENDING", "FAILED"]}},
             {"$set": {"state": "RUNNING", "started_at": now_iso()}, "$inc": {"attempts": 1}},
         )
         if not claim.modified_count:
@@ -707,16 +727,65 @@ async def run_tick(limit: int = 25) -> dict:
             )
         except Exception as e:  # noqa: BLE001
             clog(doc["lead_id"]).exception("scheduled action failed: %s", e)
-            await db.scheduled_actions.update_one(
-                {"id": doc["id"]},
-                {"$set": {"state": "FAILED", "finished_at": now_iso(), "error": str(e)}},
-            )
-            await record_event(
-                doc["lead_id"],
-                "error",
-                reason=f"scheduled.{doc.get('kind')}_failed",
-                meta={"error": str(e)[:500], "action_id": doc["id"]},
-            )
+            attempts = (doc.get("attempts") or 0) + 1
+            max_att = doc.get("max_attempts") or MAX_SCHEDULED_ATTEMPTS
+            err_str = str(e)[:500]
+
+            if attempts < max_att:
+                delay = compute_backoff_seconds(attempts)
+                next_run = started + timedelta(seconds=delay)
+                await db.scheduled_actions.update_one(
+                    {"id": doc["id"]},
+                    {
+                        "$set": {
+                            "state": "FAILED",
+                            "run_at": next_run.isoformat(),
+                            "error": str(e),
+                            "last_error": err_str,
+                            "failed_at": now_iso(),
+                        }
+                    },
+                )
+                await record_event(
+                    doc["lead_id"],
+                    "error",
+                    reason=f"scheduled.{doc.get('kind')}_failed",
+                    meta={
+                        "error": err_str,
+                        "action_id": doc["id"],
+                        "attempt": attempts,
+                        "max_attempts": max_att,
+                        "next_run_at": next_run.isoformat(),
+                        "retrying": True,
+                    },
+                )
+                summary["retried"] += 1
+            else:
+                await db.scheduled_actions.update_one(
+                    {"id": doc["id"]},
+                    {
+                        "$set": {
+                            "state": "DEAD_LETTER",
+                            "finished_at": now_iso(),
+                            "error": str(e),
+                            "last_error": err_str,
+                            "failed_at": now_iso(),
+                            "dead_letter_reason": f"Exceeded max attempts ({max_att})",
+                        }
+                    },
+                )
+                await record_event(
+                    doc["lead_id"],
+                    "error",
+                    reason="scheduled.dead_letter",
+                    meta={
+                        "error": err_str,
+                        "action_id": doc["id"],
+                        "attempts": attempts,
+                        "max_attempts": max_att,
+                    },
+                )
+                summary["dead_lettered"] += 1
             summary["failed"] += 1
 
     cutoff = (started - timedelta(minutes=CALL_TIMEOUT_MINUTES)).isoformat()
@@ -1907,6 +1976,77 @@ async def tick(limit: int = 25):
     nobody was watching.
     """
     return await run_tick(limit=limit)
+
+
+@api.get("/queue/dead-letter", dependencies=[Depends(require_admin)])
+async def list_dead_letter(limit: int = 50, skip: int = 0):
+    """List quarantined dead-letter actions with failure details."""
+    cursor = db.scheduled_actions.find({"state": "DEAD_LETTER"}).sort("failed_at", -1)
+    if skip:
+        cursor = cursor.skip(skip)
+    actions = await cursor.to_list(limit)
+
+    lead_ids = list({a.get("lead_id") for a in actions if a.get("lead_id")})
+    leads = {}
+    if lead_ids:
+        lead_docs = await db.leads.find({"id": {"$in": lead_ids}}).to_list(len(lead_ids))
+        leads = {
+            l["id"]: {
+                "name": l.get("name"),
+                "phone": l.get("phone"),
+                "status": l.get("status"),
+            }
+            for l in lead_docs
+        }
+
+    results = []
+    for a in actions:
+        results.append(
+            {
+                "id": a.get("id"),
+                "lead_id": a.get("lead_id"),
+                "kind": a.get("kind"),
+                "attempts": a.get("attempts", 0),
+                "max_attempts": a.get("max_attempts", MAX_SCHEDULED_ATTEMPTS),
+                "error": a.get("error"),
+                "last_error": a.get("last_error") or a.get("error"),
+                "failed_at": a.get("failed_at"),
+                "dead_letter_reason": a.get("dead_letter_reason"),
+                "payload": a.get("payload", {}),
+                "lead": leads.get(a.get("lead_id")),
+            }
+        )
+    return {"total": len(results), "actions": results}
+
+
+@api.post("/queue/dead-letter/{action_id}/retry", dependencies=[Depends(require_admin)])
+async def retry_dead_letter(action_id: str):
+    """Manually replay/requeue a dead-lettered action."""
+    action = await db.scheduled_actions.find_one({"id": action_id, "state": "DEAD_LETTER"})
+    if not action:
+        raise HTTPException(status_code=404, detail="Dead-letter action not found")
+
+    requeued_at = now_iso()
+    await db.scheduled_actions.update_one(
+        {"id": action_id},
+        {
+            "$set": {
+                "state": "PENDING",
+                "run_at": requeued_at,
+                "attempts": 0,
+                "last_error": None,
+                "requeued_at": requeued_at,
+            }
+        },
+    )
+    if action.get("lead_id"):
+        await record_event(
+            action["lead_id"],
+            "operator",
+            reason="scheduled.requeued",
+            meta={"action_id": action_id, "requeued_at": requeued_at},
+        )
+    return {"status": "requeued", "action_id": action_id}
 
 
 # ---------- Analytics ----------

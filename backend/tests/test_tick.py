@@ -15,7 +15,7 @@ These cover the five blockers the rewrite targeted:
 from __future__ import annotations
 
 from asyncio import run
-from datetime import timedelta
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import providers
@@ -691,4 +691,98 @@ def test_twilio_voice_gather_accumulates_speech_and_finalizes(fake_db):
     assert doc_final["status"] in ("QUALIFIED", "HOT", "NURTURE")
     assert doc_final["awaiting_transcript"] is False
     assert "call.transcript_received" in reasons(fake_db, lead_id)
+
+
+def test_scheduled_action_retries_with_exponential_backoff(fake_db):
+    lead_id = make_lead(fake_db)
+    now = server.now()
+    action = server.ScheduledAction(
+        lead_id=lead_id, kind="unsupported_task", run_at=server.now_iso()
+    )
+    run(fake_db.scheduled_actions.insert_one(server.to_mongo(action)))
+
+    summary = run(server.run_tick())
+    assert summary["failed"] == 1
+    assert summary["retried"] == 1
+    assert summary["dead_lettered"] == 0
+
+    doc = run(fake_db.scheduled_actions.find_one({"lead_id": lead_id}))
+    assert doc["state"] == "FAILED"
+    assert doc["attempts"] == 1
+    assert doc["run_at"] > now.isoformat()
+    # Backoff for attempt 1 should be at least 30s
+    run_at_dt = datetime.fromisoformat(doc["run_at"])
+    assert (run_at_dt - now).total_seconds() >= 25
+
+
+def test_scheduled_action_parks_in_dead_letter_after_max_attempts(fake_db):
+    lead_id = make_lead(fake_db)
+    # Action already attempted 4 times, next attempt will be 5 (== MAX_SCHEDULED_ATTEMPTS)
+    action = server.ScheduledAction(
+        lead_id=lead_id,
+        kind="unsupported_task",
+        run_at=server.now_iso(),
+        attempts=4,
+        max_attempts=5,
+    )
+    run(fake_db.scheduled_actions.insert_one(server.to_mongo(action)))
+
+    summary = run(server.run_tick())
+    assert summary["failed"] == 1
+    assert summary["retried"] == 0
+    assert summary["dead_lettered"] == 1
+
+    doc = run(fake_db.scheduled_actions.find_one({"lead_id": lead_id}))
+    assert doc["state"] == "DEAD_LETTER"
+    assert doc["attempts"] == 5
+    assert "Exceeded max attempts" in doc["dead_letter_reason"]
+    assert "scheduled.dead_letter" in reasons(fake_db, lead_id)
+
+
+def test_dead_letter_api_list_and_requeue(fake_db):
+    lead_id = make_lead(fake_db, name="Oliver Queen")
+    action_id = "dlq_test_123"
+    run(
+        fake_db.scheduled_actions.insert_one(
+            {
+                "id": action_id,
+                "lead_id": lead_id,
+                "kind": "supervisor",
+                "run_at": server.now_iso(),
+                "state": "DEAD_LETTER",
+                "attempts": 5,
+                "max_attempts": 5,
+                "error": "Upstream timeout",
+                "last_error": "Upstream timeout",
+                "failed_at": server.now_iso(),
+                "dead_letter_reason": "Exceeded max attempts (5)",
+                "payload": {},
+            }
+        )
+    )
+
+    # 1. List dead-letter actions
+    res = run(server.list_dead_letter())
+    assert res["total"] >= 1
+    item = next(a for a in res["actions"] if a["id"] == action_id)
+    assert item["lead"]["name"] == "Oliver Queen"
+    assert item["dead_letter_reason"] == "Exceeded max attempts (5)"
+
+    # 2. Retry dead-letter action
+    requeue_res = run(server.retry_dead_letter(action_id))
+    assert requeue_res["status"] == "requeued"
+    assert requeue_res["action_id"] == action_id
+
+    # 3. Verify state reset to PENDING and attempts reset to 0
+    doc = run(fake_db.scheduled_actions.find_one({"id": action_id}))
+    assert doc["state"] == "PENDING"
+    assert doc["attempts"] == 0
+    assert doc["last_error"] is None
+    assert "scheduled.requeued" in reasons(fake_db, lead_id)
+
+    # 4. Retrying a non-existent / non-DLQ action returns 404
+    with pytest.raises(HTTPException) as exc:
+        run(server.retry_dead_letter("non_existent_id"))
+    assert exc.value.status_code == 404
+
 
