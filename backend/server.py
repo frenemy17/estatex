@@ -324,14 +324,8 @@ async def require_admin(
 _rate_buckets: dict[str, deque[float]] = defaultdict(deque)
 
 
-def rate_limit(request: Request, bucket: str = "lead", per_min: int | None = None) -> None:
-    """Per-IP sliding window. The public capture form reaches the LLM, so an
-    unthrottled endpoint is a billing hole as much as an abuse one."""
-    limit = per_min if per_min is not None else LEAD_RATE_LIMIT_PER_MIN
-    if limit <= 0:
-        return
-    ip = (request.client.host if request.client else "unknown") or "unknown"
-    key = f"{bucket}:{ip}"
+def _in_memory_rate_limit(key: str, limit: int) -> None:
+    """Per-IP sliding window fallback using local memory."""
     window = _rate_buckets[key]
     cutoff = time.monotonic() - 60
     while window and window[0] < cutoff:
@@ -339,6 +333,41 @@ def rate_limit(request: Request, bucket: str = "lead", per_min: int | None = Non
     if len(window) >= limit:
         raise HTTPException(429, f"Rate limit: max {limit} requests/minute")
     window.append(time.monotonic())
+
+
+async def rate_limit(request: Request, bucket: str = "lead", per_min: int | None = None) -> None:
+    """Per-IP sliding window backed by MongoDB db.rate_limits with in-memory fallback.
+
+    The public capture form reaches the LLM, so an unthrottled endpoint is a billing hole
+    as much as an abuse one.
+    """
+    limit = per_min if per_min is not None else LEAD_RATE_LIMIT_PER_MIN
+    if limit <= 0:
+        return
+    ip = (request.client.host if request.client else "unknown") or "unknown"
+    key = f"{bucket}:{ip}"
+    cutoff = (now() - timedelta(seconds=60)).isoformat()
+
+    try:
+        current_db = get_db()
+        count = await current_db.rate_limits.count_documents({"key": key, "ts": {"$gte": cutoff}})
+        if count >= limit:
+            raise HTTPException(429, f"Rate limit: max {limit} requests/minute")
+
+        current_time = now()
+        await current_db.rate_limits.insert_one(
+            {
+                "key": key,
+                "ts": current_time.isoformat(),
+                "expires_at": current_time + timedelta(seconds=120),
+            }
+        )
+        _rate_buckets[key].append(time.monotonic())
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.warning("mongo rate_limits check failed (%s), falling back to in-memory: %s", key, e)
+        _in_memory_rate_limit(key, limit)
 
 
 # ---------- Events + transitions ----------
@@ -1249,8 +1278,14 @@ async def run_supervisor(lead_id: str, approve: bool | None = None) -> dict:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     try:
-        await get_db().command("ping")
+        current_db = get_db()
+        await current_db.command("ping")
         log.info("mongo connected db=%s", os.environ.get("DB_NAME", "estatex_db"))
+        try:
+            await current_db.rate_limits.create_index([("expires_at", 1)], expireAfterSeconds=0)
+            await current_db.rate_limits.create_index([("key", 1), ("ts", 1)])
+        except Exception as idx_err:
+            log.warning("could not create rate_limits indexes: %s", idx_err)
     except Exception as e:  # noqa: BLE001
         log.error("mongo unreachable at startup: %s", e)
     if providers.demo_mode():
@@ -1348,7 +1383,7 @@ async def _ingest_lead(
 
 @api.post("/lead", response_model=Lead)
 async def create_lead(payload: LeadCreate, bg: BackgroundTasks, request: Request):
-    rate_limit(request, "lead")
+    await rate_limit(request, "lead")
     return await _ingest_lead(
         name=payload.name,
         phone=payload.phone,

@@ -456,8 +456,36 @@ def test_lead_capture_is_rate_limited_per_ip(fake_db, monkeypatch):
     with pytest.raises(HTTPException) as exc:
         run(server.create_lead(payload, BackgroundTasks(), fake_request(host="9.9.9.9")))
     assert exc.value.status_code == 429
+
+    # Verify hits were written to MongoDB rate_limits collection
+    hits = run(fake_db.rate_limits.find({"key": "lead:9.9.9.9"}).to_list(10))
+    assert len(hits) == 2
+    assert "expires_at" in hits[0]
+
     # A different IP has its own budget.
     run(server.create_lead(payload, BackgroundTasks(), fake_request(host="8.8.8.8")))
+
+
+def test_rate_limit_persists_across_in_memory_cache_clearing(fake_db, monkeypatch):
+    monkeypatch.setattr(server, "LEAD_RATE_LIMIT_PER_MIN", 2)
+    server._rate_buckets.clear()
+    payload = server.LeadCreate(name="Spammer", phone="+14155558888")
+
+    # Consume 2 requests
+    for _ in range(2):
+        run(server.create_lead(payload, BackgroundTasks(), fake_request(host="7.7.7.7")))
+
+    # Clear in-memory dictionary cache to simulate server restart / separate worker
+    server._rate_buckets.clear()
+    assert len(server._rate_buckets) == 0
+
+    # 3rd request should STILL be blocked by MongoDB collection
+    with pytest.raises(HTTPException) as exc:
+        run(server.create_lead(payload, BackgroundTasks(), fake_request(host="7.7.7.7")))
+    assert exc.value.status_code == 429
+
+    # Distinct IP still succeeds
+    run(server.create_lead(payload, BackgroundTasks(), fake_request(host="6.6.6.6")))
 
 
 def test_google_webhook_is_closed_when_unconfigured(fake_db, monkeypatch):

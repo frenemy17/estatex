@@ -135,6 +135,9 @@ class FakeCollection:
     async def count_documents(self, query: dict | None = None):
         return sum(1 for d in self.docs if _matches(d, query or {}))
 
+    async def create_index(self, *args, **kwargs):
+        return "idx"
+
     def aggregate(self, pipeline: list[dict]):
         if len(pipeline) != 1 or "$group" not in pipeline[0]:
             raise NotImplementedError("FakeCollection.aggregate: only a single $group")
