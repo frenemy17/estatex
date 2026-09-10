@@ -105,6 +105,8 @@ let webpackConfig = {
     configure: {
       moduleNameMapper: {
         "^@/(.*)$": "<rootDir>/src/$1",
+        "^react-router/dom$": "<rootDir>/node_modules/react-router/dist/development/dom-export.js",
+        "^react-router$": "<rootDir>/node_modules/react-router/dist/development/index.js",
       },
     },
   },
