@@ -89,17 +89,31 @@ async def run_supervisor(lead_id: str, approve: bool | None = None) -> dict:
         {
             "$set": {
                 "supervisor_trace": merged_trace,
-                "pending_approval": bool(state.get("pending_approval")),
+                "pending_approval": bool(
+                    state.get("requires_approval") and state.get("_interrupt_at")
+                ),
                 "updated_at": now_iso(),
             }
         },
     )
+    await record_event(
+        lead_id,
+        "supervisor",
+        reason=f"next_action={state.get('next_action')}",
+        meta={
+            "trace_len": len(state.get("trace", [])),
+            "requires_approval": bool(state.get("requires_approval")),
+            "interrupt_at": state.get("_interrupt_at"),
+            "approved": state.get("approved"),
+        },
+    )
     return {
-        "lead_id": lead_id,
         "next_action": state.get("next_action"),
-        "pending_approval": state.get("pending_approval"),
+        "trace": state.get("trace", []),
+        "requires_approval": bool(
+            state.get("requires_approval") and state.get("_interrupt_at")
+        ),
         "decision": state.get("decision"),
-        "trace": merged_trace,
         "enrichment": state.get("enrichment"),
         "followup_plan": state.get("followup_plan"),
     }

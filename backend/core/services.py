@@ -55,18 +55,26 @@ async def record_provider(
 
 
 def in_quiet_hours(at: datetime | None = None) -> bool:
-    if not QUIET_HOURS_ENABLED:
+    import sys
+    srv = sys.modules.get("server")
+    enabled = getattr(srv, "QUIET_HOURS_ENABLED", QUIET_HOURS_ENABLED) if srv else QUIET_HOURS_ENABLED
+    if not enabled:
         return False
+    start = getattr(srv, "QUIET_HOURS_START", QUIET_HOURS_START) if srv else QUIET_HOURS_START
+    end = getattr(srv, "QUIET_HOURS_END", QUIET_HOURS_END) if srv else QUIET_HOURS_END
     h = (at or now()).hour
-    if QUIET_HOURS_START <= QUIET_HOURS_END:
-        return QUIET_HOURS_START <= h < QUIET_HOURS_END
-    return h >= QUIET_HOURS_START or h < QUIET_HOURS_END
+    if start <= end:
+        return start <= h < end
+    return h >= start or h < end
 
 
 def quiet_hours_end_at(at: datetime | None = None) -> datetime:
+    import sys
+    srv = sys.modules.get("server")
+    end = getattr(srv, "QUIET_HOURS_END", QUIET_HOURS_END) if srv else QUIET_HOURS_END
     ref = at or now()
     # `% 24` so a config of QUIET_HOURS_END=24 means midnight rather than crashing.
-    target = ref.replace(hour=QUIET_HOURS_END % 24, minute=0, second=0, microsecond=0)
+    target = ref.replace(hour=end % 24, minute=0, second=0, microsecond=0)
     if target <= ref:
         target += timedelta(days=1)
     return target

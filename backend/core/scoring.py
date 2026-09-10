@@ -199,9 +199,4 @@ async def qualify_and_route(lead_id: str) -> dict:
 
     lead_doc = await db.leads.find_one({"id": lead_id})
     lead = from_mongo(Lead, lead_doc)
-    return {
-        "status": lead.status,
-        "score": score,
-        "qualification": q.model_dump(),
-        "llm": llm.to_meta(),
-    }
+    return {"score": score, "lead_status": lead.status, "qualification": q.model_dump()}

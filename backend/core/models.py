@@ -107,14 +107,18 @@ class BookSlotRequest(BaseModel):
 
 
 class GoogleLeadColumn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     column_id: str
-    string_value: Optional[str] = None
+    string_value: str = ""
 
 
 class GoogleLeadPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    google_key: str
     lead_id: Optional[str] = None
-    user_column_data: list[GoogleLeadColumn] = Field(default_factory=list)
     api_version: Optional[str] = None
-    form_id: Optional[str] = None
-    campaign_id: Optional[str] = None
-    google_key: Optional[str] = None
+    form_id: Optional[int] = None
+    campaign_id: Optional[int] = None
+    is_test: bool = False
+    user_column_data: list[GoogleLeadColumn] = Field(default_factory=list)
+
