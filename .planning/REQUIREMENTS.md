@@ -55,8 +55,8 @@ Requirements for the current development cycle:
 
 ### Architecture Refactoring
 
-- [ ] **MOD-01**: Split monolithic `backend/server.py` into modular route controllers (`routes/leads.py`, `routes/webhooks.py`, `routes/admin.py`, `routes/providers.py`).
-- [ ] **MOD-02**: Extract state machine and rubric scoring logic into `backend/core/`.
+- [x] **MOD-01**: Split monolithic `backend/server.py` into modular route controllers (`routes/leads.py`, `routes/webhooks.py`, `routes/admin.py`, `routes/providers.py`).
+- [x] **MOD-02**: Extract state machine and rubric scoring logic into `backend/core/`.
 
 ### Frontend Testing & Quality
 
@@ -73,8 +73,8 @@ Requirements for the current development cycle:
 | PROV-05 | Phase 1: Real Provider Live Readiness | Complete |
 | RESIL-01 | Phase 2: Autonomous Queue Resilience | Complete |
 | RESIL-02 | Phase 2: Autonomous Queue Resilience | Complete |
-| MOD-01 | Phase 3: Monolithic Server Refactoring | Pending |
-| MOD-02 | Phase 3: Monolithic Server Refactoring | Pending |
+| MOD-01 | Phase 3: Monolithic Server Refactoring | Complete |
+| MOD-02 | Phase 3: Monolithic Server Refactoring | Complete |
 | UI-01 | Phase 4: Frontend Testing Suite | Pending |
 
 ---

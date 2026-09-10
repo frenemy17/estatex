@@ -8,7 +8,7 @@ EstateX has a complete, working, offline-tested baseline (v1 automation pipeline
 
 - [x] **Phase 1: Real Provider Live Readiness** — Verify and configure live credentials for Groq, Cal.com, Resend, Twilio, and HubSpot so every status chip is green and real API calls execute. (completed 2026-09-09)
 - [x] **Phase 2: Autonomous Queue Resilience** — Implement exponential backoff retries for failed scheduled actions and replace in-memory rate limiting with a persistent store. (completed 2026-09-10)
-- [ ] **Phase 3: Monolithic Server Refactoring** — Modularize `backend/server.py` into dedicated FastAPI routers and domain services while preserving 100% offline test passes.
+- [x] **Phase 3: Monolithic Server Refactoring** — Modularize `backend/server.py` into dedicated FastAPI routers and domain services while preserving 100% offline test passes. (completed 2026-09-10)
 - [ ] **Phase 4: Frontend Testing Suite** — Author automated unit and component tests for React components, Kanban board, and client API layers.
 
 ---
@@ -73,8 +73,8 @@ Plans:
 
 Plans:
 
-- [ ] 03-01: Extract domain logic (state machine invariants, rubric scoring, tick reconciliation) into `backend/core/`.
-- [ ] 03-02: Extract endpoint handlers into `backend/routes/` and rewire `server.py` with FastAPI router includes.
+- [x] 03-01: Extract domain logic (state machine invariants, rubric scoring, tick reconciliation) into `backend/core/`.
+- [x] 03-02: Extract endpoint handlers into `backend/routes/` and rewire `server.py` with FastAPI router includes.
 
 ---
 

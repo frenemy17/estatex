@@ -2,15 +2,15 @@
 **Monolithic Server Refactoring: Route Controllers & Assembly Shell (`backend/routes/` & `backend/server.py`)**
 
 ## Outcome
-Modularized all route controllers into domain-specific modules under `backend/routes/` (`leads.py`, `webhooks.py`, `admin.py`, `providers.py`, `auth.py`) and transformed the 2,284-line monolithic `backend/server.py` into a concise 231-line assembly shell with 100% backwards-compatible re-exports. Fulfills requirement `MOD-01`.
+Modularized all route controllers into domain-specific modules under `backend/routes/` (`backend/routes/leads.py`, `backend/routes/webhooks.py`, `backend/routes/admin.py`, `backend/routes/providers.py`, `backend/routes/auth.py`) and transformed the 2,284-line monolithic `backend/server.py` into a concise 231-line assembly shell with 100% backwards-compatible re-exports. Fulfills requirement `MOD-01`.
 
 ## Completed Tasks
 1. **Task 1: Extract Authentication and Route Controllers (`backend/routes/`)**
-   - Created `routes/auth.py` with bearer token validation (`require_admin`).
-   - Created `routes/leads.py` with lead ingestion (`/lead`, `/leads/bulk`), queries (`/leads`, `/leads/{id}`, `/events`, `/call-logs`, `/scheduled`, `/appointments`), and mutations/actions (`/opt-out`, `/book`, `/slots`, `/rerun`, `/approve`, `/reject`, `/supervisor`, `/checkpoint`).
-   - Created `routes/webhooks.py` with Google Ads lead ingest (`/webhooks/google-leads`), Vapi inbound webhook (`/webhooks/vapi`), and Twilio telephony handlers (`/voice/twiml`, `/voice/gather`, `/webhooks/twilio-sms`).
-   - Created `routes/admin.py` with scheduler ticks (`/tick`), dead-letter queue operations (`/queue/dead-letter`, `/retry`), analytics metrics (`/analytics`), test fixtures (`/seed`, `/reset`, `/simulate`), and LangGraph evaluation (`/eval`).
-   - Created `routes/providers.py` with provider status inspection (`/providers`).
+   - Created `backend/routes/auth.py` with bearer token validation (`require_admin`).
+   - Created `backend/routes/leads.py` with lead ingestion (`/lead`, `/leads/bulk`), queries (`/leads`, `/leads/{id}`, `/events`, `/call-logs`, `/scheduled`, `/appointments`), and mutations/actions (`/opt-out`, `/book`, `/slots`, `/rerun`, `/approve`, `/reject`, `/supervisor`, `/checkpoint`).
+   - Created `backend/routes/webhooks.py` with Google Ads lead ingest (`/webhooks/google-leads`), Vapi inbound webhook (`/webhooks/vapi`), and Twilio telephony handlers (`/voice/twiml`, `/voice/gather`, `/webhooks/twilio-sms`).
+   - Created `backend/routes/admin.py` with scheduler ticks (`/tick`), dead-letter queue operations (`/queue/dead-letter`, `/retry`), analytics metrics (`/analytics`), test fixtures (`/seed`, `/reset`, `/simulate`), and LangGraph evaluation (`/eval`).
+   - Created `backend/routes/providers.py` with provider status inspection (`/providers`).
    - Re-exported all routers from `backend/routes/__init__.py`.
 
 2. **Task 2: Assemble server.py Shell with Backward-Compatible Exports (`backend/server.py`)**
