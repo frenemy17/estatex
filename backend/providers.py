@@ -399,7 +399,56 @@ class VoiceProvider:
                 "vapi", transcript=mock_transcript(name, profile), call_id=None
             )
 
-        # 1. Direct Twilio Voice (free trial credit friendly, dials phone number directly)
+        # 1. Vapi AI voice agent if configured with phone number
+        if _is_vapi_ready():
+            assistant_id = os.environ.get("VAPI_ASSISTANT_ID")
+            public_url = (
+                os.environ.get("PUBLIC_URL")
+                or os.environ.get("APP_URL")
+                or os.environ.get("SERVER_URL")
+            )
+            payload: dict[str, Any] = {
+                "phoneNumberId": os.environ["VAPI_PHONE_NUMBER_ID"],
+                "customer": {"number": phone, "name": name},
+                "metadata": {"lead_id": lead_id},
+            }
+            if public_url:
+                payload["serverUrl"] = f"{public_url.rstrip('/')}/api/webhooks/vapi"
+            if assistant_id:
+                payload["assistantId"] = assistant_id
+            else:
+                payload["assistant"] = {
+                    "firstMessage": (
+                        f"Hi {name}, this is Ava from EstateX Realty. Do you have a "
+                        "moment to discuss your home search?"
+                    ),
+                    "model": {
+                        "provider": "groq",
+                        "model": GROQ_MODEL,
+                        "messages": [{"role": "system", "content": ASSISTANT_SYSTEM}],
+                    },
+                }
+
+            try:
+                res = await asyncio.to_thread(
+                    requests.post,
+                    "https://api.vapi.ai/call",
+                    headers={
+                        "Authorization": f"Bearer {os.environ['VAPI_API_KEY']}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                    timeout=15,
+                )
+                if res.status_code not in (200, 201):
+                    return _live_err("vapi", res.status_code, _body(res))
+                call_id = (res.json() or {}).get("id")
+                log.info("vapi call dispatched lead=%s call=%s", lead_id, call_id)
+                return _live_ok("vapi", res.status_code, call_id=call_id, transcript=None)
+            except Exception as e:  # noqa: BLE001
+                return _live_err("vapi", None, str(e))
+
+        # 2. Direct Twilio Voice (free trial credit friendly, dials phone number directly)
         if _is_twilio_voice_ready():
             sid = os.environ["TWILIO_ACCOUNT_SID"]
             token = os.environ["TWILIO_AUTH_TOKEN"]
@@ -431,47 +480,6 @@ class VoiceProvider:
                 return _live_ok("vapi", res.status_code, call_id=call_sid, transcript=None)
             except Exception as e:  # noqa: BLE001
                 return _live_err("vapi", None, str(e))
-
-        # 2. Vapi fallback if explicitly configured
-        assistant_id = os.environ.get("VAPI_ASSISTANT_ID")
-        payload: dict[str, Any] = {
-            "phoneNumberId": os.environ["VAPI_PHONE_NUMBER_ID"],
-            "customer": {"number": phone, "name": name},
-            "metadata": {"lead_id": lead_id},
-        }
-        if assistant_id:
-            payload["assistantId"] = assistant_id
-        else:
-            payload["assistant"] = {
-                "firstMessage": (
-                    f"Hi {name}, this is Ava from EstateX Realty. Do you have a "
-                    "moment to discuss your home search?"
-                ),
-                "model": {
-                    "provider": "groq",
-                    "model": GROQ_MODEL,
-                    "messages": [{"role": "system", "content": ASSISTANT_SYSTEM}],
-                },
-            }
-
-        try:
-            res = await asyncio.to_thread(
-                requests.post,
-                "https://api.vapi.ai/call",
-                headers={
-                    "Authorization": f"Bearer {os.environ['VAPI_API_KEY']}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=15,
-            )
-            if res.status_code not in (200, 201):
-                return _live_err("vapi", res.status_code, _body(res))
-            call_id = (res.json() or {}).get("id")
-            log.info("vapi call dispatched lead=%s call=%s", lead_id, call_id)
-            return _live_ok("vapi", res.status_code, call_id=call_id, transcript=None)
-        except Exception as e:  # noqa: BLE001
-            return _live_err("vapi", None, str(e))
 
 
 def parse_vapi_transcript(message: dict) -> list[dict[str, str]]:

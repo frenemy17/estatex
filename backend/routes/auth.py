@@ -18,12 +18,7 @@ async def require_admin(
     Deliberately fails closed: with no ``ADMIN_TOKEN`` configured, admin routes
     are unreachable rather than open. A public deploy therefore starts read-only.
     """
-    srv = sys.modules.get("server")
-    expected = (
-        getattr(srv, "ADMIN_TOKEN", None)
-        if srv and getattr(srv, "ADMIN_TOKEN", None) is not None
-        else os.environ.get("ADMIN_TOKEN")
-    )
+    expected = os.environ.get("ADMIN_TOKEN")
     if not expected:
         raise HTTPException(
             401,
