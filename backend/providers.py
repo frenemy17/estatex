@@ -407,15 +407,19 @@ class VoiceProvider:
                 or os.environ.get("APP_URL")
                 or os.environ.get("SERVER_URL")
             )
-            payload: dict[str, Any] = {
-                "phoneNumberId": os.environ["VAPI_PHONE_NUMBER_ID"],
-                "customer": {"number": phone, "name": name},
+            assistant_overrides: dict[str, Any] = {
                 "metadata": {"lead_id": lead_id},
             }
             if public_url:
-                payload["serverUrl"] = f"{public_url.rstrip('/')}/api/webhooks/vapi"
+                assistant_overrides["server"] = {"url": f"{public_url.rstrip('/')}/api/webhooks/vapi"}
+
+            payload: dict[str, Any] = {
+                "phoneNumberId": os.environ["VAPI_PHONE_NUMBER_ID"],
+                "customer": {"number": phone, "name": name},
+            }
             if assistant_id:
                 payload["assistantId"] = assistant_id
+                payload["assistantOverrides"] = assistant_overrides
             else:
                 payload["assistant"] = {
                     "firstMessage": (
@@ -427,6 +431,7 @@ class VoiceProvider:
                         "model": GROQ_MODEL,
                         "messages": [{"role": "system", "content": ASSISTANT_SYSTEM}],
                     },
+                    **assistant_overrides,
                 }
 
             try:
@@ -440,13 +445,17 @@ class VoiceProvider:
                     json=payload,
                     timeout=15,
                 )
-                if res.status_code not in (200, 201):
+                if res.status_code in (200, 201):
+                    call_id = (res.json() or {}).get("id")
+                    log.info("vapi call dispatched lead=%s call=%s", lead_id, call_id)
+                    return _live_ok("vapi", res.status_code, call_id=call_id, transcript=None)
+                log.warning("vapi call failed (%s): %s", res.status_code, _body(res))
+                if not _is_twilio_voice_ready():
                     return _live_err("vapi", res.status_code, _body(res))
-                call_id = (res.json() or {}).get("id")
-                log.info("vapi call dispatched lead=%s call=%s", lead_id, call_id)
-                return _live_ok("vapi", res.status_code, call_id=call_id, transcript=None)
             except Exception as e:  # noqa: BLE001
-                return _live_err("vapi", None, str(e))
+                log.warning("vapi call exception: %s", e)
+                if not _is_twilio_voice_ready():
+                    return _live_err("vapi", None, str(e))
 
         # 2. Direct Twilio Voice (free trial credit friendly, dials phone number directly)
         if _is_twilio_voice_ready():
