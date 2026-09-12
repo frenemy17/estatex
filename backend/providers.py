@@ -194,7 +194,7 @@ def all_provider_status() -> list[dict[str, Any]]:
 
 # ---------- LLM ----------
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b")
 GEMINI_MODEL = "gemini-2.0-flash"
 
 
