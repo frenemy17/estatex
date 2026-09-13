@@ -1,12 +1,15 @@
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { Toaster } from "sonner";
 import Layout from "./components/Layout";
+import ProtectedRoute from "./components/ProtectedRoute";
 import Landing from "./pages/Landing";
+import Login from "./pages/Login";
 import Dashboard from "./pages/Dashboard";
 import LeadDetail from "./pages/LeadDetail";
 import Analytics from "./pages/Analytics";
 import Capture from "./pages/Capture";
 import Compare from "./pages/Compare";
+import NotFound from "./pages/NotFound";
 import "./App.css";
 
 function App() {
@@ -14,14 +17,21 @@ function App() {
         <div className="App dark" data-testid="app-root">
             <BrowserRouter>
                 <Routes>
+                    {/* Public Routes */}
                     <Route path="/" element={<Landing />} />
                     <Route path="/capture" element={<Capture />} />
-                    <Route element={<Layout />}>
+                    <Route path="/login" element={<Login />} />
+
+                    {/* Protected Concierge Pipeline Routes */}
+                    <Route element={<ProtectedRoute><Layout /></ProtectedRoute>}>
                         <Route path="/app" element={<Dashboard />} />
                         <Route path="/leads/:id" element={<LeadDetail />} />
                         <Route path="/analytics" element={<Analytics />} />
                         <Route path="/compare" element={<Compare />} />
                     </Route>
+
+                    {/* 404 Catch-All */}
+                    <Route path="*" element={<NotFound />} />
                 </Routes>
             </BrowserRouter>
             <Toaster

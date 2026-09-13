@@ -3,6 +3,11 @@ import {
     getAdminToken,
     setAdminToken,
     onAdminTokenChange,
+    getAuthToken,
+    getAuthUser,
+    setAuthSession,
+    clearAuthSession,
+    onAuthChange,
     scoreBand,
     providerTone,
     providerHint,
@@ -61,6 +66,46 @@ describe("api helper logic and state", () => {
             const interceptor = api.interceptors.request.handlers[0];
             const modifiedConfig = interceptor.fulfilled(config);
             expect(modifiedConfig.headers["X-Admin-Token"]).toBeUndefined();
+        });
+    });
+
+    describe("auth session management", () => {
+        test("getAuthToken and getAuthUser return empty/null when not set", () => {
+            expect(getAuthToken()).toBe("");
+            expect(getAuthUser()).toBeNull();
+        });
+
+        test("setAuthSession sets token and user profile in storage", () => {
+            setAuthSession("jwt-test-token-xyz", { name: "Agent Test", email: "test@estatex.io" });
+            expect(getAuthToken()).toBe("jwt-test-token-xyz");
+            expect(getAuthUser()).toEqual({ name: "Agent Test", email: "test@estatex.io" });
+        });
+
+        test("clearAuthSession clears token and user profile", () => {
+            setAuthSession("jwt-temp", { name: "Temp" });
+            clearAuthSession();
+            expect(getAuthToken()).toBe("");
+            expect(getAuthUser()).toBeNull();
+        });
+
+        test("onAuthChange listens to auth session update events", () => {
+            const handler = jest.fn();
+            const cleanup = onAuthChange(handler);
+
+            setAuthSession("new-token", { name: "User" });
+            expect(handler).toHaveBeenCalledTimes(1);
+
+            cleanup();
+            setAuthSession("another-token", null);
+            expect(handler).toHaveBeenCalledTimes(1);
+        });
+
+        test("request interceptor attaches Bearer Authorization header when token exists", () => {
+            setAuthSession("secret-jwt-token-99", { name: "Agent" });
+            const config = { headers: {} };
+            const interceptor = api.interceptors.request.handlers[0];
+            const modifiedConfig = interceptor.fulfilled(config);
+            expect(modifiedConfig.headers["Authorization"]).toBe("Bearer secret-jwt-token-99");
         });
     });
 

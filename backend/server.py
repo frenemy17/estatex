@@ -125,7 +125,7 @@ from routes.admin import (
     simulate,
     tick,
 )
-from routes.auth import ADMIN_TOKEN, require_admin
+from routes.auth import ADMIN_TOKEN, require_admin, router as auth_router, hash_password
 from routes.leads import (
     _ingest_lead,
     approve_lead,
@@ -173,8 +173,31 @@ async def lifespan(_app: FastAPI):
         try:
             await current_db.rate_limits.create_index([("expires_at", 1)], expireAfterSeconds=0)
             await current_db.rate_limits.create_index([("key", 1), ("ts", 1)])
+            await current_db.users.create_index([("email", 1)], unique=True)
+            await current_db.leads.create_index([("id", 1)], unique=True)
+            await current_db.leads.create_index([("phone", 1)])
+            await current_db.leads.create_index([("status", 1)])
+            await current_db.leads.create_index([("created_at", -1)])
+            await current_db.events.create_index([("lead_id", 1), ("ts", 1)])
+            await current_db.scheduled_actions.create_index([("status", 1), ("run_at", 1)])
+            await current_db.appointments.create_index([("lead_id", 1)])
         except Exception as idx_err:
-            log.warning("could not create rate_limits indexes: %s", idx_err)
+            log.warning("could not create database indexes: %s", idx_err)
+
+        try:
+            existing_agent = await current_db.users.find_one({"email": "agent@estatex.io"})
+            if not existing_agent:
+                await current_db.users.insert_one({
+                    "id": "agent_demo_default",
+                    "name": "Alex Vance (Lead Concierge)",
+                    "email": "agent@estatex.io",
+                    "hashed_password": hash_password("estatex2026"),
+                    "role": "agent",
+                    "created_at": now_iso(),
+                })
+                log.info("provisioned default demo agent (agent@estatex.io / estatex2026)")
+        except Exception as seed_user_err:
+            log.warning("could not provision default demo agent: %s", seed_user_err)
     except Exception as e:  # noqa: BLE001
         log.error("mongo unreachable at startup: %s", e)
     if providers.demo_mode():
@@ -220,6 +243,7 @@ async def health():
 
 
 # Include sub-routers into /api
+api.include_router(auth_router)
 api.include_router(leads_router)
 api.include_router(webhooks_router)
 api.include_router(admin_router)
