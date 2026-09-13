@@ -31,30 +31,36 @@ Probabilistic LLMs and voice agents handle conversational qualification, reasoni
 - [x] V2 LangGraph supervisor engine (`agents/graph.py` + `agents/supervisor.py`) with `MongoCheckpointer`.
 - [x] Human-in-the-loop approval interrupts (`escalate` -> `/approve` or `/reject`).
 - [x] Autonomous background reconciliation worker (`/api/tick`) draining `scheduled_actions` and rescuing stranded calls.
-- [x] Zero-dependency offline pytest test harness (69 passing tests with in-memory Motor double).
+- [x] **LIVE-01**: Live provider verification — Groq LLM, Cal.com API v2, Resend, and HubSpot CRM operating in LIVE mode with real API calls.
+- [x] **AUTO-01**: Exponential backoff retry loop and Dead-Letter Queue (DLQ) for `scheduled_actions` in `/api/tick`.
+- [x] **REFACTOR-01**: Modularized monolithic `server.py` into dedicated routers (`routes/`) and domain packages (`core/`), shrinking server entry point by ~90%.
+- [x] **TEST-01**: Comprehensive frontend testing suite (Jest + RTL) covering Kanban pipeline, lead details, live provider chips, and API helpers.
+- [x] **AUTH-01**: Full JWT authentication system with native bcrypt hashing (`routes/auth.py`), route guards (`ProtectedRoute.jsx`), and auto-seeded demo concierge.
+- [x] **VOICE-03**: In-browser Web Speech API audio synthesis for turn-by-turn playback of qualification calls.
+- [x] **TEST-02**: 138 total automated tests (82 pytest backend + 56 Jest frontend) passing 100% with zero flakes.
 
-### Active
+### Active (Next Milestone Goals)
 
-- [ ] **LIVE-01**: Live provider verification — ensure all external SaaS integrations (Groq, Cal.com, Resend, Twilio, HubSpot) operate in LIVE mode with verified credentials.
-- [ ] **AUTO-01**: Exponential backoff retry loop for `FAILED` scheduled actions (PRD Backlog P1).
-- [ ] **REFACTOR-01**: Modularize monolithic `server.py` (1,904 lines) into decoupled routers and domain services (PRD Backlog P2).
-- [ ] **TEST-01**: Automated frontend testing suite for React components, Kanban board, and API client.
+- [ ] **DEPLOY-01**: Production deployment configuration for Render (Backend) and Vercel (Frontend) with GitHub Actions cron keep-alive.
+- [ ] **EXPORT-01**: CSV/PDF lead audit report export for brokerage managers.
+- [ ] **MULTI-01**: Multi-brokerage workspace isolation and role-based permissions (Broker Owner vs Lead Concierge).
 
 ### Out of Scope
 
-- **Distributed multi-tenant billing & organization isolation** — single-tenant admin token model suffices for current production deployment.
-- **Replacing bespoke StateGraph with full heavy `langgraph` package** — current 139-line zero-dependency engine meets all requirements without dependency bloat.
+- **Heavy Redis/Celery queue dependencies** — queue-less architecture via MongoDB `scheduled_actions` and FastAPI BackgroundTasks is optimal for cloud free tiers.
+- **Replacing bespoke StateGraph with external heavy `langgraph` package** — current 139-line zero-dependency engine meets all requirements without dependency bloat.
 - **Mobile native apps** — responsive React 19 web application serves mobile browser needs.
 
 ## Context
 
 - **Codebase Map**: Documented in detail under `.planning/codebase/` (`STACK.md`, `ARCHITECTURE.md`, `STRUCTURE.md`, `CONVENTIONS.md`, `TESTING.md`, `INTEGRATIONS.md`, `CONCERNS.md`).
-- **Provider Contract**: Managed centrally in `backend/providers.py` via `ProviderResult`. Any provider lacking keys or in `DEMO_MODE=1` falls back cleanly to mock without crashes.
-- **Database**: MongoDB with Motor async driver. No Redis or Celery dependencies.
+- **Provider Contract**: Managed centrally in `backend/providers.py` via `ProviderResult`. Any provider lacking keys falls back cleanly to mock without crashes.
+- **Database**: Cloud MongoDB Atlas cluster (`cluster0.n8kxzlk.mongodb.net`, DB: `estatex`) with automatic compound indexes.
+- **Test Suite**: 138 automated tests (82 pytest + 56 Jest), running in ~8 seconds total.
 
 ## Constraints
 
-- **Security**: Destructive/expensive endpoints fail closed (HTTP 401) when `ADMIN_TOKEN` is unset or mismatched (`secrets.compare_digest`).
+- **Security**: Destructive/expensive endpoints fail closed (HTTP 401) when `ADMIN_TOKEN` or JWT bearer token is missing or invalid.
 - **Testing**: Zero-network test execution must remain true for the test suite (`backend/tests/conftest.py`).
 - **Reliability**: A failed live booking must never mark a lead as `BOOKED`.
 - **Telephony Gates**: Live voice calls and SMS gated by explicit flags (`VOICE_ENABLED=1`, `SMS_ENABLED=1`) to prevent billing accidents.
@@ -67,6 +73,8 @@ Probabilistic LLMs and voice agents handle conversational qualification, reasoni
 | Queue-less architecture (FastAPI BackgroundTasks + MongoDB `scheduled_actions`) | Eliminates Redis/Celery operational complexity on cloud free tiers | ✓ Good |
 | Single qualification code path for mock & live | Ensures live webhook path cannot diverge or drift from local testing and demo logic | ✓ Good |
 | In-memory Motor test double | Enables zero-install, zero-database local `pytest` testing for reviewers and CI | ✓ Good |
+| Native bcrypt + PyJWT Bearer auth | Eliminates passlib 1.7.4 deprecation bugs on Python 3.14 while providing standard 7-day tokens | ✓ Good |
+| In-browser Web Speech API audio synthesizer | Provides realistic call playback without requiring paid cellular phone carrier minutes | ✓ Good |
 
 ---
-*Last updated: 2026-09-09 after docs ingestion from docs/PRD.md*
+*Last updated: 2026-09-13 after v1.0 milestone completion*
