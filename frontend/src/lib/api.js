@@ -40,9 +40,56 @@ export function onAdminTokenChange(handler) {
     return () => window.removeEventListener(ADMIN_EVENT, handler);
 }
 
+const AUTH_KEY = "estatex_auth_token";
+const USER_KEY = "estatex_auth_user";
+const AUTH_EVENT = "estatex:auth-change";
+
+export function getAuthToken() {
+    try {
+        return localStorage.getItem(AUTH_KEY) || "";
+    } catch {
+        return "";
+    }
+}
+
+export function getAuthUser() {
+    try {
+        const raw = localStorage.getItem(USER_KEY);
+        return raw ? JSON.parse(raw) : null;
+    } catch {
+        return null;
+    }
+}
+
+export function setAuthSession(token, user) {
+    try {
+        if (token) {
+            localStorage.setItem(AUTH_KEY, token);
+            if (user) localStorage.setItem(USER_KEY, JSON.stringify(user));
+        } else {
+            localStorage.removeItem(AUTH_KEY);
+            localStorage.removeItem(USER_KEY);
+        }
+    } catch {
+        /* ignore */
+    }
+    window.dispatchEvent(new Event(AUTH_EVENT));
+}
+
+export function clearAuthSession() {
+    setAuthSession(null, null);
+}
+
+export function onAuthChange(handler) {
+    window.addEventListener(AUTH_EVENT, handler);
+    return () => window.removeEventListener(AUTH_EVENT, handler);
+}
+
 api.interceptors.request.use((config) => {
-    const token = getAdminToken();
-    if (token) config.headers["X-Admin-Token"] = token;
+    const adminToken = getAdminToken();
+    if (adminToken) config.headers["X-Admin-Token"] = adminToken;
+    const authToken = getAuthToken();
+    if (authToken) config.headers["Authorization"] = `Bearer ${authToken}`;
     return config;
 });
 
@@ -80,8 +127,8 @@ export function scoreBand(score) {
 
 export const PROVIDER_TONES = {
     LIVE_OK: { color: "#34d399", label: "Live", dot: "bg-emerald-400" },
-    LIVE_ERROR: { color: "#fbbf24", label: "Degraded", dot: "bg-amber-400 animate-pulse-dot" },
-    MOCK: { color: "#64748b", label: "Mock", dot: "bg-slate-500" },
+    LIVE_ERROR: { color: "#ef4444", label: "Failed", dot: "bg-red-500 animate-pulse-dot" },
+    MOCK: { color: "#eab308", label: "Mock", dot: "bg-yellow-500" },
 };
 
 export function providerTone(p) {

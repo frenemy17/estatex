@@ -1,0 +1,27 @@
+{
+  "source_path": "docs/PRD.md",
+  "type": "PRD",
+  "confidence": "high",
+  "manifest_override": false,
+  "title": "EstateX — PRD",
+  "summary": "Real-estate AI lead qualifier and autonomous follow-up platform with voice, calendar booking, CRM sync, and multi-agent supervisor.",
+  "scope": [
+    "FastAPI",
+    "MongoDB",
+    "Motor",
+    "Groq",
+    "Vapi",
+    "Cal.com",
+    "Twilio",
+    "Resend",
+    "HubSpot",
+    "StateGraph",
+    "lead qualification",
+    "supervisor agent",
+    "scheduled actions"
+  ],
+  "cross_refs": [],
+  "locked": false,
+  "precedence": null,
+  "notes": ""
+}

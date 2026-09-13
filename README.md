@@ -4,7 +4,7 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![Groq LLM](https://img.shields.io/badge/Groq-llama--3.3--70b--versatile-orange?logo=groq&logoColor=white)](https://groq.com/)
 [![MongoDB](https://img.shields.io/badge/MongoDB-Motor%20async-47A248?logo=mongodb&logoColor=white)](https://www.mongodb.com/)
-[![Tests](https://img.shields.io/badge/tests-69%20passing%20offline-brightgreen)](#-tests)
+[![Tests](https://img.shields.io/badge/tests-138%20passing%20(82%20backend%20%2B%2056%20frontend)-brightgreen)](#-tests)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 > **"Every lead you don't call in 5 minutes is someone else's client."**
@@ -12,7 +12,7 @@
 EstateX captures a real-estate lead, calls it back within seconds, qualifies the buyer into
 structured fields, scores them 0–100 against an explainable rubric, routes them, books a
 viewing, and follows up on its own schedule — with a human-approval gate on the leads worth
-the most money.
+the most money. Dedicated JWT-authenticated concierge portal and in-browser voice playback.
 
 **Design rule: the agent proposes, the state machine enforces.** The LLM extracts and
 decides; scoring, transitions, CRM writes and booking commits are deterministic code.
@@ -237,6 +237,9 @@ Try it: `curl -X POST localhost:8000/api/tick -H "X-Admin-Token: $ADMIN_TOKEN"`
 | :--- | :--- | :--- |
 | `GET` | `/api/health` | DB reachability, demo mode, quiet-hours state, provider modes |
 | `GET` | `/api/providers` | Per-provider mode + last real call outcome (drives the chips) |
+| `POST` | `/api/auth/login` | Agency concierge login with JWT access token generation |
+| `POST` | `/api/auth/register` | Create concierge account with native bcrypt hashing |
+| `GET` | `/api/auth/me` | Fetch active authenticated concierge agent profile |
 | `POST` | `/api/lead` | Capture (dedupe by phone, rate-limited) + dispatch the pipeline |
 | `POST` | `/api/leads/bulk` 🔒 | CSV/Excel bulk import |
 | `POST` | `/api/webhooks/google-leads` | Google Ads lead form (key-verified) |
@@ -254,19 +257,30 @@ Try it: `curl -X POST localhost:8000/api/tick -H "X-Admin-Token: $ADMIN_TOKEN"`
 | `GET` | `/api/analytics` · `/api/eval` | Funnel KPIs (single `$group`) / rubric agreement |
 | `POST` | `/api/seed` · `/api/simulate` 🔒 · `DELETE` `/api/reset` 🔒 | Demo data management |
 
-🔒 = requires `X-Admin-Token`.
+🔒 = requires `X-Admin-Token` or authenticated agent session.
+
+### 🔑 Demo Concierge Credentials
+The platform auto-seeds a verified Concierge Agent account on first boot (or available via the **"⚡ 1-Click Demo Login"** button on `/login`):
+- **Email:** `agent@estatex.io`
+- **Password:** `estatex2026`
+- **Role:** `Lead Concierge` (Agency Admin)
 
 ---
 
 ## 🧪 Tests
 
 ```bash
-cd backend
-pytest
+# 1. Backend pytest suite (82 tests)
+pytest backend/tests
+
+# 2. Frontend Jest suite (56 tests)
+cd frontend && npm test -- --watchAll=false
 ```
 
 ```text
-======================= 69 passed, 113 warnings in 1.47s =======================
+Backend:  ======================= 82 passed, 206 warnings in 3.46s =======================
+Frontend: Test Suites: 10 passed, 10 total | Tests: 56 passed, 56 total
+Total:    138 passing automated tests (100% pass rate)
 ```
 
 **No server, no database, no network, no extra installs.** `tests/conftest.py` provides a

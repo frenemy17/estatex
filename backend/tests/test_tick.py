@@ -15,7 +15,7 @@ These cover the five blockers the rewrite targeted:
 from __future__ import annotations
 
 from asyncio import run
-from datetime import timedelta
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import providers
@@ -55,7 +55,7 @@ def lead_doc(fake_db, lead_id: str) -> dict:
     return run(fake_db.leads.find_one({"id": lead_id}))
 
 
-def fake_request(host: str = "10.0.0.1", headers: dict | None = None, body=None, form=None):
+def fake_request(host: str = "10.0.0.1", headers: dict | None = None, body=None, form=None, query_params: dict | None = None):
     async def _json():
         return body
 
@@ -65,6 +65,7 @@ def fake_request(host: str = "10.0.0.1", headers: dict | None = None, body=None,
     return SimpleNamespace(
         client=SimpleNamespace(host=host),
         headers=headers or {},
+        query_params=query_params or {},
         json=_json,
         form=_form,
     )
@@ -455,8 +456,36 @@ def test_lead_capture_is_rate_limited_per_ip(fake_db, monkeypatch):
     with pytest.raises(HTTPException) as exc:
         run(server.create_lead(payload, BackgroundTasks(), fake_request(host="9.9.9.9")))
     assert exc.value.status_code == 429
+
+    # Verify hits were written to MongoDB rate_limits collection
+    hits = run(fake_db.rate_limits.find({"key": "lead:9.9.9.9"}).to_list(10))
+    assert len(hits) == 2
+    assert "expires_at" in hits[0]
+
     # A different IP has its own budget.
     run(server.create_lead(payload, BackgroundTasks(), fake_request(host="8.8.8.8")))
+
+
+def test_rate_limit_persists_across_in_memory_cache_clearing(fake_db, monkeypatch):
+    monkeypatch.setattr(server, "LEAD_RATE_LIMIT_PER_MIN", 2)
+    server._rate_buckets.clear()
+    payload = server.LeadCreate(name="Spammer", phone="+14155558888")
+
+    # Consume 2 requests
+    for _ in range(2):
+        run(server.create_lead(payload, BackgroundTasks(), fake_request(host="7.7.7.7")))
+
+    # Clear in-memory dictionary cache to simulate server restart / separate worker
+    server._rate_buckets.clear()
+    assert len(server._rate_buckets) == 0
+
+    # 3rd request should STILL be blocked by MongoDB collection
+    with pytest.raises(HTTPException) as exc:
+        run(server.create_lead(payload, BackgroundTasks(), fake_request(host="7.7.7.7")))
+    assert exc.value.status_code == 429
+
+    # Distinct IP still succeeds
+    run(server.create_lead(payload, BackgroundTasks(), fake_request(host="6.6.6.6")))
 
 
 def test_google_webhook_is_closed_when_unconfigured(fake_db, monkeypatch):
@@ -655,3 +684,133 @@ def test_eval_grades_against_the_rubric_and_flags_baseline_mode(fake_db):
     # Honest labelling: with no LLM key both sides are the same code path.
     assert report["baseline_only"] is True
     assert report["disagreements"] == []
+
+
+def test_twilio_voice_twiml_endpoint_returns_greeting_and_gather(fake_db):
+    lead_id = make_lead(fake_db, name="Diana Prince")
+    req = fake_request(query_params={"lead_id": lead_id})
+    resp = run(server.voice_twiml_endpoint(req, lead_id=lead_id))
+    assert resp.media_type == "application/xml"
+    assert b"Diana Prince" in resp.body
+    assert b"<Gather input=\"speech\"" in resp.body
+    assert b"Polly.Joanna" in resp.body
+
+
+def test_twilio_voice_gather_accumulates_speech_and_finalizes(fake_db):
+    lead_id = make_lead(fake_db, name="Bruce Wayne", status="CALLING")
+
+    # Turn 1: Lead responds with intent
+    req1 = fake_request(form={"SpeechResult": "Looking to buy a luxury property", "CallSid": "CA_tw_01"})
+    resp1 = run(server.voice_gather_endpoint(req1, lead_id=lead_id, step=1))
+    assert resp1.media_type == "application/xml"
+    assert b"<Gather input=\"speech\"" in resp1.body
+    doc1 = lead_doc(fake_db, lead_id)
+    assert any("Looking to buy" in t.get("text", "") for t in doc1.get("transcript", []))
+
+    # Turn 4 (Final turn): Lead provides final detail, call concludes and qualifies
+    req4 = fake_request(form={"SpeechResult": "Budget 10 million preapproved in Gotham", "CallSid": "CA_tw_01"})
+    resp4 = run(server.voice_gather_endpoint(req4, lead_id=lead_id, step=4))
+    assert resp4.media_type == "application/xml"
+    assert b"<Hangup/>" in resp4.body
+    assert b"recorded your preferences" in resp4.body
+
+    # Lead should now be qualified out of CALLING
+    doc_final = lead_doc(fake_db, lead_id)
+    assert doc_final["status"] in ("QUALIFIED", "HOT", "NURTURE")
+    assert doc_final["awaiting_transcript"] is False
+    assert "call.transcript_received" in reasons(fake_db, lead_id)
+
+
+def test_scheduled_action_retries_with_exponential_backoff(fake_db):
+    lead_id = make_lead(fake_db)
+    now = server.now()
+    action = server.ScheduledAction(
+        lead_id=lead_id, kind="unsupported_task", run_at=server.now_iso()
+    )
+    run(fake_db.scheduled_actions.insert_one(server.to_mongo(action)))
+
+    summary = run(server.run_tick())
+    assert summary["failed"] == 1
+    assert summary["retried"] == 1
+    assert summary["dead_lettered"] == 0
+
+    doc = run(fake_db.scheduled_actions.find_one({"lead_id": lead_id}))
+    assert doc["state"] == "FAILED"
+    assert doc["attempts"] == 1
+    assert doc["run_at"] > now.isoformat()
+    # Backoff for attempt 1 should be at least 30s
+    run_at_dt = datetime.fromisoformat(doc["run_at"])
+    assert (run_at_dt - now).total_seconds() >= 25
+
+
+def test_scheduled_action_parks_in_dead_letter_after_max_attempts(fake_db):
+    lead_id = make_lead(fake_db)
+    # Action already attempted 4 times, next attempt will be 5 (== MAX_SCHEDULED_ATTEMPTS)
+    action = server.ScheduledAction(
+        lead_id=lead_id,
+        kind="unsupported_task",
+        run_at=server.now_iso(),
+        attempts=4,
+        max_attempts=5,
+    )
+    run(fake_db.scheduled_actions.insert_one(server.to_mongo(action)))
+
+    summary = run(server.run_tick())
+    assert summary["failed"] == 1
+    assert summary["retried"] == 0
+    assert summary["dead_lettered"] == 1
+
+    doc = run(fake_db.scheduled_actions.find_one({"lead_id": lead_id}))
+    assert doc["state"] == "DEAD_LETTER"
+    assert doc["attempts"] == 5
+    assert "Exceeded max attempts" in doc["dead_letter_reason"]
+    assert "scheduled.dead_letter" in reasons(fake_db, lead_id)
+
+
+def test_dead_letter_api_list_and_requeue(fake_db):
+    lead_id = make_lead(fake_db, name="Oliver Queen")
+    action_id = "dlq_test_123"
+    run(
+        fake_db.scheduled_actions.insert_one(
+            {
+                "id": action_id,
+                "lead_id": lead_id,
+                "kind": "supervisor",
+                "run_at": server.now_iso(),
+                "state": "DEAD_LETTER",
+                "attempts": 5,
+                "max_attempts": 5,
+                "error": "Upstream timeout",
+                "last_error": "Upstream timeout",
+                "failed_at": server.now_iso(),
+                "dead_letter_reason": "Exceeded max attempts (5)",
+                "payload": {},
+            }
+        )
+    )
+
+    # 1. List dead-letter actions
+    res = run(server.list_dead_letter())
+    assert res["total"] >= 1
+    item = next(a for a in res["actions"] if a["id"] == action_id)
+    assert item["lead"]["name"] == "Oliver Queen"
+    assert item["dead_letter_reason"] == "Exceeded max attempts (5)"
+
+    # 2. Retry dead-letter action
+    requeue_res = run(server.retry_dead_letter(action_id))
+    assert requeue_res["status"] == "requeued"
+    assert requeue_res["action_id"] == action_id
+
+    # 3. Verify state reset to PENDING and attempts reset to 0
+    doc = run(fake_db.scheduled_actions.find_one({"id": action_id}))
+    assert doc["state"] == "PENDING"
+    assert doc["attempts"] == 0
+    assert doc["last_error"] is None
+    assert "scheduled.requeued" in reasons(fake_db, lead_id)
+
+    # 4. Retrying a non-existent / non-DLQ action returns 404
+    with pytest.raises(HTTPException) as exc:
+        run(server.retry_dead_letter("non_existent_id"))
+    assert exc.value.status_code == 404
+
+

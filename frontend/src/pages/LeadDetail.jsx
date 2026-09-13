@@ -4,7 +4,7 @@ import { api, STATUS_META, isErrorEvent, scoreBand } from "../lib/api";
 import { usePoll } from "../lib/usePoll";
 import { Button } from "../components/ui/button";
 import { toast } from "sonner";
-import { ArrowLeft, Robot, Brain, CalendarCheck, Phone, Sparkle, Check, Warning } from "@phosphor-icons/react";
+import { ArrowLeft, Robot, Brain, CalendarCheck, Phone, Sparkle, Check, Warning, SpeakerHigh, Stop } from "@phosphor-icons/react";
 
 export default function LeadDetail() {
     const { id } = useParams();
@@ -14,6 +14,8 @@ export default function LeadDetail() {
     const [slots, setSlots] = useState([]);
     const [appts, setAppts] = useState([]);
     const [busy, setBusy] = useState(false);
+    const [playingAudio, setPlayingAudio] = useState(false);
+    const [currentTurn, setCurrentTurn] = useState(null);
 
     async function load() {
         try {
@@ -45,7 +47,58 @@ export default function LeadDetail() {
 
     useEffect(() => {
         loadSlots();
+        return () => {
+            if (typeof window !== "undefined" && "speechSynthesis" in window) {
+                window.speechSynthesis.cancel();
+            }
+        };
     }, [id]);
+
+    function stopTranscriptAudio() {
+        if (typeof window !== "undefined" && "speechSynthesis" in window) {
+            window.speechSynthesis.cancel();
+        }
+        setPlayingAudio(false);
+        setCurrentTurn(null);
+    }
+
+    function playTranscriptAudio() {
+        if (!lead?.transcript?.length) return;
+        if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+            toast.error("Audio speech synthesis is not supported in this browser");
+            return;
+        }
+
+        window.speechSynthesis.cancel();
+        setPlayingAudio(true);
+
+        const utterances = lead.transcript.map((t, idx) => {
+            const u = new SpeechSynthesisUtterance(t.text);
+            if (t.role === "agent") {
+                u.pitch = 1.15;
+                u.rate = 1.05;
+            } else {
+                u.pitch = 0.95;
+                u.rate = 0.98;
+            }
+            u.onstart = () => {
+                setCurrentTurn(idx);
+            };
+            if (idx === lead.transcript.length - 1) {
+                u.onend = () => {
+                    setPlayingAudio(false);
+                    setCurrentTurn(null);
+                };
+            }
+            u.onerror = () => {
+                setPlayingAudio(false);
+                setCurrentTurn(null);
+            };
+            return u;
+        });
+
+        utterances.forEach((u) => window.speechSynthesis.speak(u));
+    }
 
     async function bookSlot(slot) {
         setBusy(true);
@@ -293,25 +346,60 @@ export default function LeadDetail() {
                 {/* Right: Transcript + supervisor trace + events */}
                 <div className="col-span-12 lg:col-span-7 space-y-6">
                     <div className="border border-slate-800/80 bg-slate-950/40 rounded-lg p-6">
-                        <div className="flex items-center gap-2 mb-4">
-                            <Phone size={18} weight="duotone" className="text-cyan-400" />
-                            <span className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-200">
-                                AI Conversation Transcript
-                            </span>
+                        <div className="flex items-center justify-between gap-2 mb-4">
+                            <div className="flex items-center gap-2">
+                                <Phone size={18} weight="duotone" className="text-cyan-400" />
+                                <span className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-200">
+                                    AI Conversation Transcript
+                                </span>
+                            </div>
+                            {lead.transcript?.length > 0 && (
+                                <Button
+                                    size="sm"
+                                    onClick={playingAudio ? stopTranscriptAudio : playTranscriptAudio}
+                                    className={`h-7 px-3 text-xs font-semibold gap-1.5 transition-all ${
+                                        playingAudio
+                                            ? "border border-amber-500/50 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20"
+                                            : "bg-cyan-500 hover:bg-cyan-400 text-slate-950 shadow-sm"
+                                    }`}
+                                    data-testid="btn-toggle-audio"
+                                >
+                                    {playingAudio ? (
+                                        <>
+                                            <Stop size={12} weight="fill" /> Stop Audio
+                                        </>
+                                    ) : (
+                                        <>
+                                            <SpeakerHigh size={14} weight="bold" /> Listen to Call
+                                        </>
+                                    )}
+                                </Button>
+                            )}
                         </div>
                         {lead.transcript?.length ? (
                             <div className="space-y-2 max-h-[380px] overflow-y-auto pr-2">
                                 {lead.transcript.map((t, i) => (
                                     <div
                                         key={i}
-                                        className={`p-2.5 rounded font-mono text-xs ${
+                                        className={`p-2.5 rounded font-mono text-xs transition-all duration-300 ${
                                             t.role === "agent"
                                                 ? "bg-cyan-500/5 border border-cyan-500/20 text-cyan-100"
                                                 : "bg-slate-900/60 border border-slate-800 text-slate-300 ml-6"
+                                        } ${
+                                            currentTurn === i
+                                                ? "ring-2 ring-cyan-400 shadow-[0_0_15px_rgba(34,211,238,0.35)] scale-[1.01]"
+                                                : ""
                                         }`}
                                     >
-                                        <div className="text-[9px] uppercase tracking-[0.2em] text-slate-500 mb-1">
-                                            {t.role === "agent" ? "AI Agent" : lead.name}
+                                        <div className="flex items-center justify-between gap-2 mb-1">
+                                            <div className="text-[9px] uppercase tracking-[0.2em] text-slate-500">
+                                                {t.role === "agent" ? "AI Agent" : lead.name}
+                                            </div>
+                                            {currentTurn === i && (
+                                                <span className="text-[9px] font-mono text-cyan-400 uppercase tracking-widest animate-pulse flex items-center gap-1">
+                                                    <SpeakerHigh size={10} weight="fill" /> Speaking
+                                                </span>
+                                            )}
                                         </div>
                                         {t.text}
                                     </div>

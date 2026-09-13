@@ -1,9 +1,9 @@
 import { NavLink, Outlet, useNavigate, Link } from "react-router-dom";
-import { House, ChartLineUp, GitBranch, Plus, MagnifyingGlass, SquaresFour } from "@phosphor-icons/react";
+import { House, ChartLineUp, Plus, MagnifyingGlass, SquaresFour, SignOut } from "@phosphor-icons/react";
 import { Button } from "./ui/button";
 import { toast } from "sonner";
-import { api } from "../lib/api";
-import { useState } from "react";
+import { api, getAuthUser, clearAuthSession, onAuthChange } from "../lib/api";
+import { useState, useEffect } from "react";
 import { useAdminToken } from "./AdminTokenButton";
 
 const nav = [
@@ -14,7 +14,20 @@ const nav = [
 export default function Layout() {
     const navigate = useNavigate();
     const [seeding, setSeeding] = useState(false);
+    const [user, setUser] = useState(getAuthUser());
     const admin = useAdminToken();
+
+    useEffect(() => {
+        return onAuthChange(() => {
+            setUser(getAuthUser());
+        });
+    }, []);
+
+    const handleSignOut = () => {
+        clearAuthSession();
+        toast.info("Signed out of concierge session");
+        navigate("/login");
+    };
 
     async function handleSeed() {
         setSeeding(true);
@@ -68,13 +81,35 @@ export default function Layout() {
                     ))}
                 </nav>
 
-                <div className="p-4 border-t border-slate-800/80">
+                {/* Sidebar footer user & seed */}
+                <div className="p-4 border-t border-slate-800/80 space-y-3">
+                    {user && (
+                        <div className="p-2.5 rounded-lg bg-slate-900/50 border border-slate-800 flex items-center justify-between" data-testid="sidebar-user">
+                            <div className="flex items-center gap-2 overflow-hidden">
+                                <div className="w-7 h-7 rounded-md bg-gradient-to-br from-amber-400 to-amber-600 text-slate-950 font-bold grid place-items-center text-xs shrink-0">
+                                    {user.name ? user.name.charAt(0).toUpperCase() : "A"}
+                                </div>
+                                <div className="min-w-0">
+                                    <div className="text-xs font-medium text-slate-200 truncate">{user.name || "Agent"}</div>
+                                    <div className="text-[10px] text-slate-500 truncate">{user.email}</div>
+                                </div>
+                            </div>
+                            <button
+                                onClick={handleSignOut}
+                                title="Sign Out"
+                                className="p-1 text-slate-400 hover:text-red-400 transition-colors"
+                                data-testid="sidebar-signout"
+                            >
+                                <SignOut size={16} />
+                            </button>
+                        </div>
+                    )}
                     <Button
                         onClick={handleSeed}
                         disabled={seeding || !admin}
                         title={admin ? undefined : "Read-only demo — add the backend ADMIN_TOKEN to enable this"}
                         variant="outline"
-                        className="w-full border-slate-800 bg-slate-900/40 text-slate-300 hover:bg-slate-800 hover:text-slate-50 disabled:opacity-40 disabled:cursor-not-allowed"
+                        className="w-full border-slate-800 bg-slate-900/40 text-slate-300 hover:bg-slate-800 hover:text-slate-50 disabled:opacity-40 disabled:cursor-not-allowed text-xs"
                         data-testid="btn-seed-leads"
                     >
                         {seeding ? "Seeding…" : "Seed 15 Demo Leads"}
@@ -89,13 +124,15 @@ export default function Layout() {
                         <MagnifyingGlass size={16} />
                         <span className="text-xs uppercase tracking-[0.24em]">Command Center</span>
                     </div>
-                    <Button
-                        onClick={() => navigate("/capture")}
-                        className="bg-amber-400 hover:bg-amber-300 text-slate-950 font-semibold"
-                        data-testid="btn-new-lead"
-                    >
-                        <Plus size={16} weight="bold" className="mr-1.5" /> New Lead
-                    </Button>
+                    <div className="flex items-center gap-3">
+                        <Button
+                            onClick={() => navigate("/capture")}
+                            className="bg-amber-400 hover:bg-amber-300 text-slate-950 font-semibold"
+                            data-testid="btn-new-lead"
+                        >
+                            <Plus size={16} weight="bold" className="mr-1.5" /> New Lead
+                        </Button>
+                    </div>
                 </header>
 
                 <div className="flex-1 min-h-0">

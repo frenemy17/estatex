@@ -1,0 +1,33 @@
+{
+  "contract": "1.0.0",
+  "flavor": "core",
+  "milestone": null,
+  "phases": [
+    {
+      "number": "1",
+      "name": "Real Provider Live Readiness",
+      "status": "complete"
+    },
+    {
+      "number": "2",
+      "name": "Autonomous Queue Resilience",
+      "status": "complete"
+    },
+    {
+      "number": "3",
+      "name": "Monolithic Server Refactoring",
+      "status": "complete"
+    },
+    {
+      "number": "4",
+      "name": "Frontend Testing Suite",
+      "status": "complete"
+    }
+  ],
+  "next": {
+    "command": "/gsd-progress",
+    "label": "Show progress",
+    "reason": "Unsure of state — showing progress"
+  },
+  "updated_at": "2026-09-13T07:53:33.933Z"
+}
