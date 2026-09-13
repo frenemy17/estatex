@@ -9,6 +9,8 @@ python-multipart>=0.0.9     # form-encoded Twilio inbound-SMS webhook
 python-dotenv>=1.0.1
 requests>=2.31.0            # provider HTTP calls, run in a worker thread
 certifi>=2024.2.2           # TLS CA bundle for mongodb+srv on hosts without one
+bcrypt>=4.1.0               # native bcrypt password hashing
+PyJWT>=2.8.0                # JWT access token encoding/decoding
 
 # Optional LLM fallback: only imported when GROQ_API_KEY holds a non-Groq
 # (Google AI Studio) key. Safe to remove — Groq is the primary path and the
