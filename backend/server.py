@@ -209,11 +209,23 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="EstateX AI Lead Concierge", lifespan=lifespan)
+
+
+@app.get("/")
+async def root():
+    return {"service": "estatex-ai-lead-concierge", "status": "ok"}
+
+
+@app.get("/health")
+async def root_health():
+    return await health()
+
+
 api = APIRouter(prefix="/api")
 
 
 @api.get("/")
-async def root():
+async def api_root():
     return {"service": "estatex-ai-lead-concierge", "status": "ok"}
 
 
