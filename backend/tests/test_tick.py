@@ -814,3 +814,12 @@ def test_dead_letter_api_list_and_requeue(fake_db):
     assert exc.value.status_code == 404
 
 
+def test_root_and_health_endpoints(fake_db):
+    """Ensure root and health endpoints return status 200 for keep-alive pings."""
+    root_res = run(server.root())
+    assert root_res["status"] == "ok"
+
+    health_res = run(server.root_health())
+    assert health_res["status"] == "ok"
+
+
