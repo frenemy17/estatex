@@ -133,6 +133,27 @@ export default function Dashboard() {
             {/* Live integration status — grey mock / green live / amber failing */}
             <ProviderStatus />
 
+            {/* Render Cloud Wake-Up / Pipeline Syncing Status */}
+            {loading && (
+                <div className="flex items-center justify-between p-3.5 rounded-xl border border-amber-500/25 bg-amber-500/5 backdrop-blur-md text-amber-300 text-xs float-up">
+                    <div className="flex items-center gap-2.5">
+                        <span className="relative flex h-2 w-2">
+                            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
+                            <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-400"></span>
+                        </span>
+                        <span className="font-medium text-slate-200">
+                            Connecting to Render cloud backend & syncing pipeline...
+                        </span>
+                        <span className="text-slate-400 text-[11px] hidden sm:inline">
+                            (Free tier containers take 30–45s to wake up on first visit)
+                        </span>
+                    </div>
+                    <div className="w-20 sm:w-28 h-1 bg-slate-900 rounded-full overflow-hidden relative border border-slate-800">
+                        <div className="absolute top-0 bottom-0 left-0 w-1/2 bg-amber-400 rounded-full animate-shimmer-bar" />
+                    </div>
+                </div>
+            )}
+
             {/* Controls Bar: Search & Quick Filters */}
             <div className="flex flex-col sm:flex-row items-center justify-between gap-4 p-4 rounded-xl border border-slate-800/80 bg-slate-950/60 backdrop-blur-xl">
                 <div className="flex items-center gap-3 w-full sm:w-auto">
@@ -257,13 +278,18 @@ export default function Dashboard() {
 
                         {/* Column Content */}
                         <div className="p-3 space-y-3 min-h-[300px] flex-1">
-                            {columns[s].length === 0 && (
+                            {loading ? (
+                                <div className="h-full flex flex-col items-center justify-center text-center p-6 border border-slate-800/40 rounded-lg animate-pulse">
+                                    <div className="w-5 h-5 rounded-full border-2 border-amber-400/30 border-t-amber-400 animate-spin mb-2" />
+                                    <span className="text-[11px] font-mono text-slate-500">Syncing stage…</span>
+                                </div>
+                            ) : columns[s].length === 0 ? (
                                 <div className="h-full flex flex-col items-center justify-center text-center p-6 border border-dashed border-slate-800/80 rounded-lg">
                                     <span className="text-xs font-mono uppercase tracking-[0.16em] text-slate-600">
                                         No leads
                                     </span>
                                 </div>
-                            )}
+                            ) : null}
                             {columns[s].map((l) => (
                                 <LeadCard key={l.id} lead={l} onClick={() => nav(`/leads/${l.id}`)} />
                             ))}

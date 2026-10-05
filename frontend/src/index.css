@@ -163,4 +163,14 @@
     .marquee {
         animation: marquee 40s linear infinite;
     }
+
+    @keyframes shimmer-bar {
+        0% { transform: translateX(-100%); }
+        100% { transform: translateX(350%); }
+    }
+
+    .animate-shimmer-bar {
+        animation: shimmer-bar 1.8s ease-in-out infinite;
+    }
 }
+

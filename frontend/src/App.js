@@ -2,6 +2,7 @@ import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { Toaster } from "sonner";
 import Layout from "./components/Layout";
 import ProtectedRoute from "./components/ProtectedRoute";
+import ServerWakeBanner from "./components/ServerWakeBanner";
 import Landing from "./pages/Landing";
 import Login from "./pages/Login";
 import Dashboard from "./pages/Dashboard";
@@ -15,6 +16,7 @@ import "./App.css";
 function App() {
     return (
         <div className="App dark" data-testid="app-root">
+            <ServerWakeBanner />
             <BrowserRouter>
                 <Routes>
                     {/* Public Routes */}

@@ -85,13 +85,79 @@ export function onAuthChange(handler) {
     return () => window.removeEventListener(AUTH_EVENT, handler);
 }
 
+/* ---------- Server cold-start and wake-up status tracking ----------
+ * Render free-tier services sleep after 15 minutes of inactivity. When a visitor
+ * triggers an API request or visits the page, initial spin-up takes 30-45 seconds.
+ * We track in-flight requests that exceed 1200ms and notify listeners so a
+ * reassuring loader informs the viewer rather than making them think the app is broken.
+ */
+const SERVER_STATUS_EVENT = "estatex:server-status";
+let inFlightRequests = 0;
+let slowRequestTimer = null;
+let serverIsWaking = false;
+
+function emitServerStatus(status, details = {}) {
+    if (typeof window !== "undefined") {
+        window.dispatchEvent(
+            new CustomEvent(SERVER_STATUS_EVENT, { detail: { status, ...details } })
+        );
+    }
+}
+
+export function onServerStatusChange(handler) {
+    if (typeof window === "undefined") return () => {};
+    const listener = (e) => handler(e.detail);
+    window.addEventListener(SERVER_STATUS_EVENT, listener);
+    return () => window.removeEventListener(SERVER_STATUS_EVENT, listener);
+}
+
+export function warmupBackend() {
+    return api.get("/health").catch(() => {});
+}
+
+function handleRequestDone() {
+    inFlightRequests = Math.max(0, inFlightRequests - 1);
+    if (inFlightRequests === 0) {
+        if (slowRequestTimer) {
+            clearTimeout(slowRequestTimer);
+            slowRequestTimer = null;
+        }
+        if (serverIsWaking) {
+            serverIsWaking = false;
+            emitServerStatus("awake", { inFlight: 0 });
+        }
+    }
+}
+
 api.interceptors.request.use((config) => {
+    inFlightRequests++;
+    if (inFlightRequests === 1 && !slowRequestTimer) {
+        slowRequestTimer = setTimeout(() => {
+            if (inFlightRequests > 0) {
+                serverIsWaking = true;
+                emitServerStatus("waking", { inFlight: inFlightRequests });
+            }
+        }, 1200);
+    }
+
     const adminToken = getAdminToken();
     if (adminToken) config.headers["X-Admin-Token"] = adminToken;
     const authToken = getAuthToken();
     if (authToken) config.headers["Authorization"] = `Bearer ${authToken}`;
     return config;
 });
+
+api.interceptors.response.use(
+    (response) => {
+        handleRequestDone();
+        return response;
+    },
+    (error) => {
+        handleRequestDone();
+        return Promise.reject(error);
+    }
+);
+
 
 export const STATUSES = [
     "NEW",
