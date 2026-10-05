@@ -5,6 +5,10 @@
   "installCommand": "npm install --legacy-peer-deps",
   "rewrites": [
     {
+      "source": "/api/:path*",
+      "destination": "https://estatex-backend-4dhi.onrender.com/api/:path*"
+    },
+    {
       "source": "/(.*)",
       "destination": "/index.html"
     }
